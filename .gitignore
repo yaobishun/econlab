@@ -1,0 +1,49 @@
+# Local research libraries, conversations, imported papers and run results
+**/.local/
+**/.venv/
+**/venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/node_modules/
+*.py[cod]
+*.log
+
+# Credentials and machine-specific configuration
+**/.env*
+**/.codex/
+**/.aws/
+**/auth.json
+**/credentials*.json
+**/secrets*.json
+*.pem
+*.key
+*.pfx
+*.p12
+*.dpapi
+
+# Author materials and datasets: keep locally until redistribution is cleared
+/econlab/pilot/author/
+*.pdf
+*.mat
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.csv
+*.dta
+*.xlsx
+*.xls
+*.parquet
+*.rds
+*.RData
+*.h5
+*.hdf5
+
+# Generated packages and archives
+/dist/
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz

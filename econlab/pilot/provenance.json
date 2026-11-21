@@ -1,0 +1,85 @@
+{
+  "paper": "Quantitative Spatial Economics (2017)",
+  "scope": "Author 30x30 quantitative experiment: initial equilibrium, country-border removal, location-border removal",
+  "input_fields": [
+    "alpha",
+    "sigma",
+    "LL",
+    "LLwest",
+    "LLeast",
+    "F",
+    "fund",
+    "dist",
+    "bord",
+    "bordcty",
+    "cbord",
+    "cbordcty",
+    "NN",
+    "N"
+  ],
+  "reference_fields": [
+    "w",
+    "L",
+    "P",
+    "r",
+    "realwage",
+    "cw",
+    "cL",
+    "cP",
+    "cr",
+    "crealwage",
+    "ccw",
+    "ccL",
+    "ccP",
+    "ccr",
+    "ccrealwage"
+  ],
+  "author_files": [
+    {
+      "path": "author/Helpman_E.m",
+      "sha256": "211aedeca478803afeac707697b98eec134cd69a973e509113f7fccdf31c9f0f",
+      "source": "qse2017.rar/qse2017/Helpman_E.m"
+    },
+    {
+      "path": "author/Quantitative Spatial Economics.pdf",
+      "sha256": "78ad64c4561d4a10e13a05802ef9db10f06222fbf4bd54e388cf144cf0f92369",
+      "source": "qse2017.rar/qse2017/Quantitative Spatial Economics.pdf"
+    },
+    {
+      "path": "author/Grid30.mat",
+      "sha256": "e00ce7f55df6670df2f543fa2c9e379502444bd9156560dec0e3a6de449e34db",
+      "source": "qse2017.rar/qse2017/Grid30.mat"
+    },
+    {
+      "path": "author/functions/Hlandprice.m",
+      "sha256": "91f3e41970d0e77e461285452ea3ada152632dee2c8828d7b418d573943f7414",
+      "source": "qse2017.rar/qse2017/functions/Hlandprice.m"
+    },
+    {
+      "path": "author/functions/Hpindex.m",
+      "sha256": "2649d4519876e18f803fe967d97a9cd55c2c7172a2b05719352ee0a3e6052219",
+      "source": "qse2017.rar/qse2017/functions/Hpindex.m"
+    },
+    {
+      "path": "author/functions/Hrealw.m",
+      "sha256": "d6142ed40361a3079e3b580a2e6ec17ba4658e32f3f5dbce82c33fb7fbfe7f53",
+      "source": "qse2017.rar/qse2017/functions/Hrealw.m"
+    },
+    {
+      "path": "author/functions/Hwelfaregains.m",
+      "sha256": "cf5b48fa733b9e98c09fb2226a8d154e869a3f026a2d06772012e81235af53bb",
+      "source": "qse2017.rar/qse2017/functions/Hwelfaregains.m"
+    },
+    {
+      "path": "author/functions/solveHLwCtyOpen.m",
+      "sha256": "69bfe2d6fca8328c295cf3721585cb60c9a567b23664178fefbecf96c994a105",
+      "source": "qse2017.rar/qse2017/functions/solveHLwCtyOpen.m"
+    },
+    {
+      "path": "author/functions/solveHLwCtyOpen_E.m",
+      "sha256": "896f2664452222b74ebe48bb9f8ba1451094ebd62d6add8da6088cffd0903226",
+      "source": "qse2017.rar/qse2017/functions/solveHLwCtyOpen_E.m"
+    }
+  ],
+  "parameter_note": "Author code uses dist.^0.33; paper section 3.9 reports 0.375. Preserve and disclose the package version; do not silently change either."
+}
