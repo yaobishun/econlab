@@ -57,6 +57,10 @@ def init():
             result TEXT,status TEXT,created TEXT,updated TEXT);
         CREATE TABLE IF NOT EXISTS deletions(id TEXT PRIMARY KEY,kind TEXT,target_id TEXT,details TEXT,created TEXT);
         ''')
+    import materials
+    materials.init()
+    import execution_agent
+    execution_agent.init()
 
 
 def clean(value):return re.sub(r'\s+',' ',value or '').strip()
@@ -88,6 +92,8 @@ def get(kind,identifier):
         value['history']=[_decode(r) for r in c.execute('SELECT * FROM revisions WHERE entity_type=? AND entity_id=? ORDER BY revision DESC',(kind,identifier))]
         value['reviews']=[dict(r) for r in c.execute('SELECT * FROM reviews WHERE entity_type=? AND entity_id=? ORDER BY created DESC',(kind,identifier))]
         if kind=='paper':
+            import materials
+            value['reproduction']=materials.state(identifier)
             value['assets']=[_decode(r) for r in c.execute('SELECT * FROM assets WHERE paper_id=? ORDER BY created',(identifier,))]
             value['methods']=[_decode(r) for r in c.execute('SELECT m.* FROM methods m JOIN method_sources s ON m.id=s.method_id WHERE s.paper_id=?',(identifier,))]
             value['tools']=[_decode(r) for r in c.execute('SELECT t.* FROM tools t JOIN tool_sources s ON t.id=s.tool_id WHERE s.paper_id=?',(identifier,))]
@@ -99,8 +105,15 @@ def get(kind,identifier):
             if kind=='method':
                 value['tools']=[_decode(r) for r in c.execute('SELECT * FROM tools WHERE method_id=?',(identifier,))]
                 value['spec']['evidence']=[ref for row in c.execute('SELECT evidence FROM method_sources WHERE method_id=?',(identifier,)) for ref in store.decode(row[0],[])]
+                value['reproduction_plans']=[]
+                for row in c.execute('SELECT w.paper_id,w.status,w.stage,w.state FROM material_workflows w JOIN method_sources s ON s.paper_id=w.paper_id WHERE s.method_id=?',(identifier,)):
+                    data=store.decode(row['state'],{})
+                    if data.get('method_id')==identifier:value['reproduction_plans'].append({'paper_id':row['paper_id'],'status':row['status'],'stage':row['stage'],'plan':data.get('method_plan',{})})
             else:
                 value['runs']=[_decode(r) for r in c.execute('SELECT * FROM runs WHERE tool_id=? ORDER BY created DESC LIMIT 30',(identifier,))]
+                import environments
+                try:value['environment']=environments.status(value)
+                except ValueError as exc:value['environment']={'status':'failed','error':str(exc)}
     return value
 
 
@@ -123,10 +136,10 @@ def add_asset(paper_id,name,content,role='other'):
     name=Path(name.replace('\\','/')).name
     if not name or len(name)>250:raise ValueError('Invalid filename')
     digest=hashlib.sha256(content).hexdigest();suffix=Path(name).suffix.lower()
-    if suffix not in {'.pdf','.txt','.md','.py','.m','.json','.csv','.mat','.zip','.rar','.r','.R','.do','.ipynb'}:raise ValueError('Unsupported attachment format')
+    if suffix not in {'.pdf','.txt','.md','.py','.m','.json','.csv','.mat','.zip','.rar','.r','.do','.ipynb','.yaml','.yml','.toml','.ini','.lock','.dta','.xlsx','.npy','.npz','.pkl','.pickle','.rda','.rdata','.rds','.parquet','.gz','.tgz','.tar'}:raise ValueError('Unsupported attachment format')
     relative='files/'+digest+suffix;path=store.file_path(relative)
     text=''
-    if suffix in {'.txt','.md','.py','.m','.json','.csv','.r','.do'}:
+    if suffix in {'.txt','.md','.py','.m','.json','.csv','.r','.do','.yaml','.yml','.toml','.ini','.lock'}:
         try:text=content.decode('utf-8-sig')
         except UnicodeDecodeError:text=content.decode('gb18030',errors='replace')
     metadata={'size':len(content),'suffix':suffix}
@@ -230,10 +243,31 @@ def create_method(paper_id,name,spec,actor='AI'):
     return get('method',identifier)
 
 
+def check_tool_contract(spec):
+    if not isinstance(spec,dict):raise ValueError('Tool configuration must be an object')
+    params=spec.get('parameters',[])
+    if not isinstance(params,list):raise ValueError('parameters必须是业务参数列表；数组数据放入input_asset文件，无业务参数使用[]')
+    names=[]
+    for field in params:
+        if not isinstance(field,dict) or not isinstance(field.get('name'),str) or not field['name'].strip() or field.get('type','number') not in ('number','integer','boolean','string'):raise ValueError('业务参数需声明name及number/integer/boolean/string类型；数组放入输入文件')
+        names.append(field['name'])
+    if len(names)!=len(set(names)):raise ValueError('Duplicate tool parameter names')
+    paths=spec.get('bundle_paths',{})
+    if not isinstance(paths,dict) or any(not isinstance(aid,str) or not (isinstance(value,str) or isinstance(value,list) and all(isinstance(p,str) for p in value)) for aid,value in paths.items()):raise ValueError('bundle_paths必须是附件ID到相对路径的对象，无映射使用{}')
+    fields=spec.get('validation_fields',[])
+    if not isinstance(fields,list) or any(not isinstance(v,str) or not v for v in fields):raise ValueError('validation_fields must list numeric output field names')
+
+
 def create_tool(paper_id,method_id,name,spec,code='',language='python',actor='AI'):
     if not isinstance(name,str) or not name.strip() or not isinstance(spec,dict) or not isinstance(code,str) or language not in ('python','matlab'):raise ValueError('Invalid tool name, configuration, code or runtime')
+    check_tool_contract(spec)
+    import environments
+    environments.configuration({'language':language,'spec':spec})
+    from runner import VALIDATION_POLICY
+    if 'validation_policy' in spec and spec['validation_policy']!=VALIDATION_POLICY:raise ValueError('复现验收采用宿主统一标准，不能在工具说明中更改')
+    if spec.get('request_mode','file') not in ('file','json'):raise ValueError('request_mode must be file or json')
     authorized={a['id'] for a in get('paper',paper_id)['assets']}
-    ids=list(spec.get('asset_ids',[]))+list(spec.get('author_code_assets',[]))+[spec[k] for k in ('input_asset','reference_asset') if spec.get(k)]
+    ids=list(spec.get('asset_ids',[]))+list(spec.get('author_code_assets',[]))+list(spec.get('code_assets',[]))+[spec[k] for k in ('input_asset','reference_asset') if spec.get(k)]
     if any(a not in authorized for a in ids):raise ValueError('Tool materials must be attached to this source paper')
     if spec.get('source_kind')=='author_adapter' and actor!='bootstrap':raise ValueError('Author provenance must be registered from checked source files')
     with store.db() as c:
@@ -293,6 +327,13 @@ def update(kind,identifier,patch,expected_revision,actor,reason='',allow_visual=
             if ref.get('paper_id') not in sources:raise ValueError('Method evidence must come from a linked source paper')
             check_evidence(ref['paper_id'],[ref],allow_visual)
     if kind=='tool':
+        check_tool_contract(patch.get('spec',before['spec']))
+        import environments
+        environments.configuration({'language':patch.get('language',before['language']),'spec':patch.get('spec',before['spec'])})
+        from runner import VALIDATION_POLICY
+        value=patch.get('spec',before['spec'])
+        if 'validation_policy' in value and value['validation_policy']!=VALIDATION_POLICY:raise ValueError('复现验收采用宿主统一标准，不能在工具说明中更改')
+        if patch.get('spec',before['spec']).get('request_mode','file') not in ('file','json'):raise ValueError('request_mode must be file or json')
         if 'method_id' in patch:
             new_method=get('method',patch['method_id'])
             if not {s['id'] for s in before['sources']}<={s['id'] for s in new_method['sources']}:raise ValueError('The destination method must share all of this tool\'s source papers')
@@ -301,10 +342,10 @@ def update(kind,identifier,patch,expected_revision,actor,reason='',allow_visual=
         if 'code' in patch and not isinstance(patch['code'],str):raise ValueError('Tool code must be text')
         if 'spec' in patch:
             authorized={a['id'] for p in before['sources'] for a in get('paper',p['id'])['assets']}
-            ids=list(patch['spec'].get('asset_ids',[]))+list(patch['spec'].get('author_code_assets',[]))+[patch['spec'].get(k) for k in ('input_asset','reference_asset') if patch['spec'].get(k)]
+            ids=list(patch['spec'].get('asset_ids',[]))+list(patch['spec'].get('author_code_assets',[]))+list(patch['spec'].get('code_assets',[]))+[patch['spec'].get(k) for k in ('input_asset','reference_asset') if patch['spec'].get(k)]
             if any(a not in authorized for a in ids):raise ValueError('Tool assets must belong to its linked source papers')
             if patch['spec'].get('source_kind')=='author_adapter' and before['spec'].get('source_kind')!='author_adapter':raise ValueError('Cannot self-assign author provenance')
-    after={k:v for k,v in before.items() if k not in ('history','reviews','sources','tools','runs','assets','methods','page_count')}
+    after={k:v for k,v in before.items() if k not in ('history','reviews','sources','tools','runs','assets','methods','page_count','reproduction','reproduction_plans','environment')}
     after.update(patch)
     if all(after[k]==before[k] for k in patch):return before
     after.update(revision=expected_revision+1,review_status='draft',updated=store.now())
@@ -421,9 +462,10 @@ def delete_paper(paper_id):
         paths=[r['path'] for r in c.execute('SELECT path FROM assets WHERE paper_id=?',(paper_id,))]
         mids=[r[0] for r in c.execute('SELECT method_id FROM method_sources WHERE paper_id=?',(paper_id,))]
         tids=[r[0] for r in c.execute('SELECT tool_id FROM tool_sources WHERE paper_id=?',(paper_id,))]
-        session=c.execute("SELECT id,thread_id FROM sessions WHERE scope='paper' AND scope_id=?",(paper_id,)).fetchone()
+        sessions=c.execute('SELECT id,thread_id FROM sessions WHERE scope_id=?',(paper_id,)).fetchall()
+        session=next((s for s in sessions if s['thread_id']),None)
         c.execute("UPDATE jobs SET status='cancelled',stage='Paper deleted; three-library links reconciled',updated=? WHERE paper_id=? AND status IN ('queued','running')",(store.now(),paper_id))
-        if session:c.execute('DELETE FROM sessions WHERE id=?',(session['id'],))
+        c.execute('DELETE FROM sessions WHERE scope_id=?',(paper_id,))
         c.execute('DELETE FROM papers WHERE id=?',(paper_id,))
         for tid in tids:
             if not c.execute('SELECT 1 FROM tool_sources WHERE tool_id=?',(tid,)).fetchone():c.execute('DELETE FROM tools WHERE id=?',(tid,));removed_tools.append(tid)
@@ -437,7 +479,7 @@ def delete_paper(paper_id):
                 c.execute("UPDATE methods SET spec=?,revision=?,review_status='draft',updated=? WHERE id=?",(store.encode(spec),after['revision'],after['updated'],mid))
                 _audit(c,'method',mid,before,after,'system','Deleted paper; remaining source evidence rebuilt')
                 c.execute("UPDATE tools SET validation_status='stale',review_status='draft' WHERE method_id=?",(mid,))
-        details={'paper_id':paper_id,'title':paper['title'],'removed_methods':removed_methods,'removed_tools':removed_tools,'stale_tools':stale_tools,'thread_id':session['thread_id'] if session else None}
+        details={'paper_id':paper_id,'title':paper['title'],'removed_methods':removed_methods,'removed_tools':removed_tools,'stale_tools':stale_tools,'thread_id':session['thread_id'] if session else None,'thread_ids':[s['thread_id'] for s in sessions if s['thread_id']]}
         c.execute('INSERT INTO deletions VALUES (?,?,?,?,?)',(store.uid(),'paper',paper_id,store.encode(details),store.now()))
         retained={r[0] for r in c.execute('SELECT path FROM assets')}
     for relative in set(paths)-retained:
@@ -502,17 +544,29 @@ def jobs(paper_id=None):
 
 
 def fingerprint(tool):
-    spec=tool['spec'];ids=list(spec.get('asset_ids',[]))+list(spec.get('author_code_assets',[]))
+    spec=tool['spec'];ids=list(spec.get('asset_ids',[]))+list(spec.get('author_code_assets',[]))+list(spec.get('code_assets',[]))
     for key in ('input_asset','reference_asset'):
         if spec.get(key):ids.append(spec[key])
     sources=[]
     for identifier in sorted(set(ids)):
         item=asset(identifier);asset_path(identifier);sources.append((identifier,item['sha256']))
     method=get('method',tool['method_id'])
-    return store.digest({'tool_revision':tool['revision'],'code':tool['code'],'spec':spec,'language':tool['language'],'sources':sources,'method_revision':method['revision'],'method_spec':method['spec']})
+    payload={'tool_revision':tool['revision'],'code':tool['code'],'spec':spec,'language':tool['language'],'sources':sources,'method_revision':method['revision'],'method_spec':method['spec']}
+    if spec.get('environment',{}).get('requirements'):
+        import environments
+        runtime=environments.status(tool)
+        payload['runtime_environment']={'status':runtime['status'],'detected':runtime.get('detected')}
+    return store.digest(payload)
 
 
 def method_candidates(question,conditions):
+    # A named source paper must survive the lexical shortlist. Otherwise common
+    # trade/welfare words can push its actual executable method out of the top 8.
+    normalize=lambda value:re.sub(r'[\W_]+','',value.lower())
+    query=normalize(question)
+    named_sources={p['id'] for p in listing('paper') if len(normalize(p['title']))>=8 and normalize(p['title']) in query}
+    with store.db() as c:
+        named_methods={r['method_id'] for r in c.execute('SELECT method_id,paper_id FROM method_sources') if r['paper_id'] in named_sources}
     terms=re.findall(r'[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2}',question+' '+store.encode(conditions))
     pairs=[('贸易','trade'),('福利','welfare'),('人口','population'),('空间','spatial'),('摩擦','friction'),('成本','cost'),('劳动','labor')]
     for zh,en in pairs:
@@ -521,6 +575,7 @@ def method_candidates(question,conditions):
     for method in listing('method'):
         if not method['spec'].get('problem'):continue
         body=store.encode(method).lower();score=sum(min(body.count(t.lower()),5) for t in terms)
+        if method['id'] in named_methods:score+=1000
         if score:
             method=get('method',method['id']);method['retrieval_score']=score
             ranked.append(method)

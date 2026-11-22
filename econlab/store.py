@@ -10,6 +10,7 @@ import sqlite3
 import uuid
 
 ROOT=Path(__file__).resolve().parent
+VERSION='3.2.1'
 DATA=Path(os.environ.get('ECONLAB_DATA',ROOT/'.local')).resolve()
 MAX_FILE=50*1024*1024
 

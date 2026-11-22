@@ -37,6 +37,11 @@
 *.parquet
 *.rds
 *.RData
+*.rda
+*.pkl
+*.pickle
+*.npy
+*.npz
 *.h5
 *.hdf5
 

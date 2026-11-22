@@ -21,6 +21,25 @@ class CurrentEdition(unittest.TestCase):
   m=self.method();code=catalog.add_asset(self.p['id'],'author.py',b'def reference_model(x): return [x]','code');a=catalog.add_asset(self.p['id'],'input.json',b'{}','data');r=catalog.add_asset(self.p['id'],'reference.json',b'{"answer":[100.0]}','reference');t=catalog.create_tool(self.p['id'],m['id'],'Test tool',{'parameters':[{'name':'x','type':'number','min':0,'max':100,'default':100}],'asset_ids':[a['id'],r['id'],code['id']],'author_code_assets':[code['id']],'input_asset':a['id'],'reference_asset':r['id'],'validation_fields':['answer']},"def run(inputs,workspace):\n return {'answer':[inputs['x']]}\n");return catalog.review('tool',t['id'],'confirmed','Tester','Inspected fixture code',t['revision'])
  def test_three_links_duplicate_and_text(self):
   other,dup=catalog.import_paper('same.pdf',catalog.asset_path(self.p['original_asset']).read_bytes());self.assertTrue(dup);self.assertEqual(other['id'],self.p['id']);self.assertEqual(len(self.p['methods']),1);self.assertEqual(len(self.p['tools']),1);self.assertIn('labor mobility',catalog.page(self.p['id'],1)['text'])
+ def test_failed_author_rerun_revokes_verified_status(self):
+  t=self.tool();self.assertEqual(runner.execute(t['id'],{},True)['status'],'passed')
+  with patch.object(runner.subprocess,'Popen') as proc:
+   proc.return_value.wait.return_value=1
+   result=runner.execute(t['id'],{},True)
+  self.assertEqual(result['status'],'failed');self.assertEqual(catalog.get('tool',t['id'])['validation_status'],'failed')
+  with self.assertRaises(ValueError):runner.execute(t['id'],{},False)
+  def answer(jid,pid,prompt,schema,**kwargs):
+   self.assertIn('latest_validation_attempt',prompt);self.assertIn(result['run_id'],prompt);self.assertIn('Tool program failed',prompt)
+   return {'explanation':'The current author run failed','selected_method_id':t['method_id'],'selected_tool_id':t['id'],'missing_information':[],'applicability':[],'parameters_json':'{}'}
+  j=catalog.job('solve')
+  with patch.object(engine,'ask',side_effect=answer):plan=engine.solve_plan(j['id'],None,'trade welfare',{})
+  self.assertFalse(plan['selected_tool_id']);self.assertTrue(plan['missing_information'])
+ def test_named_paper_methods_survive_generic_lexical_noise(self):
+  catalog.update('paper',self.p['id'],{'title':'Goods Trade, Factor Mobility and Welfare'},self.p['revision'],'Tester')
+  target=self.method();other,_=catalog.import_paper('unrelated.pdf',pdf('Unrelated source document'))
+  for i in range(9):catalog.create_method(other['id'],'Distractor '+str(i),{'problem':'Goods Trade Factor Mobility Welfare infrastructure transport epsilon model '*8,'equations':str(i)})
+  ranked=catalog.method_candidates('Use Goods Trade, Factor Mobility, and Welfare to study infrastructure transport with epsilon=4',{})
+  self.assertEqual(ranked[0]['id'],target['id']);self.assertEqual(ranked[0]['sources'][0]['id'],self.p['id'])
  def test_revision_conflict(self):
   r=catalog.update('paper',self.p['id'],{'title':'Human edit'},1,'Editor');self.assertEqual(len(r['history']),2)
   with self.assertRaisesRegex(ValueError,'conflict'):catalog.update('paper',self.p['id'],{'title':'Overwrite'},1,'Other')
@@ -72,6 +91,75 @@ class CurrentEdition(unittest.TestCase):
   catalog.update('tool',t['id'],{'code':t['code']+'# changed'},t['revision'],'Editor')
   with patch.object(engine,'ask',return_value={'explanation':'stale plan','selected_method_id':t['method_id'],'selected_tool_id':t['id'],'missing_information':[],'applicability':[],'parameters_json':'{}'}):plan=engine.solve_plan(j['id'],None,'trade welfare',{})
   self.assertEqual(plan['selected_tool_id'],'');self.assertTrue(plan['missing_information'])
+ def test_solver_explanation_keeps_numeric_rows_and_country_labels(self):
+  import json
+  t=self.tool();values=[i+1.234567 for i in range(34)]
+  ref=catalog.add_asset(self.p['id'],'large-reference.json',store.encode({'answer':values}).encode(),'reference')
+  code="# Output is a finite-change decomposition, not an exact income ratio.\ndef run(inputs,workspace):\n return {'answer':[i+1.234567 for i in range(34)],'countries':['C%02d'%i for i in range(34)]}\n"
+  t=catalog.update('tool',t['id'],{'code':code,'spec':{**t['spec'],'reference_asset':ref['id'],'asset_ids':[*t['spec']['asset_ids'],ref['id']]}},t['revision'],'Tester');catalog.review('tool',t['id'],'confirmed','Tester','Controlled output-context fixture',t['revision'])
+  self.assertEqual(runner.execute(t['id'],{},True)['status'],'passed')
+  chosen={'explanation':'Fixture plan','selected_method_id':t['method_id'],'selected_tool_id':t['id'],'missing_information':[],'applicability':[],'parameters_json':'{}'}
+  j=catalog.job('solve')
+  with patch.object(engine,'ask',return_value=chosen):plan=engine.solve_plan(j['id'],None,'trade welfare',{})
+  def explain(jid,pid,prompt,**kwargs):
+   actual=json.loads(prompt.split('\n实际运行：',1)[1]);self.assertEqual(actual['outputs']['answer'],values);self.assertEqual(actual['outputs']['countries'][-1],'C33')
+   implementation=json.loads(prompt.split('\n工具口径与实现：',1)[1].split('\n实际运行：',1)[0]);self.assertEqual(implementation['code'],code);self.assertTrue(implementation['code_complete']);self.assertEqual(actual['label'],'R1')
+   return 'Actual rows retained'
+  with patch.object(engine,'ask',side_effect=explain):result=engine.solve_execute(j['id'],None,plan['id'],{},True)
+  self.assertNotIn('explanation_warning',result);self.assertEqual(result['explanation'],'Actual rows retained')
+ def test_large_explanation_outputs_are_explicitly_summarized(self):
+  values={'countries':['AAA','BBB'],'values':list(range(20000))}
+  summary=engine.explanation_outputs(values,budget=100)
+  self.assertEqual(summary['countries'],values['countries']);self.assertTrue(summary['values']['truncated']);self.assertEqual(summary['values']['max'],19999);self.assertEqual(len(values['values']),20000)
+ def test_unprovided_citation_rejects_explanation_but_keeps_actual_result(self):
+  t=self.tool();self.assertEqual(runner.execute(t['id'],{},True)['status'],'passed')
+  chosen={'explanation':'Fixture plan','selected_method_id':t['method_id'],'selected_tool_id':t['id'],'missing_information':[],'applicability':[],'parameters_json':'{}'}
+  j=catalog.job('solve')
+  with patch.object(engine,'ask',return_value=chosen):plan=engine.solve_plan(j['id'],None,'trade welfare',{})
+  with patch.object(engine,'ask',return_value='Unsupported explanation [S1，第1页；S999]'):result=engine.solve_execute(j['id'],None,plan['id'],{},True)
+  self.assertEqual(result['status'],'passed');self.assertEqual(result['outputs']['answer'],[100.0]);self.assertIn('explanation_warning',result);self.assertNotIn('S999',result['explanation'])
+ def test_codex_turn_snapshot_matches_only_requested_turn(self):
+  from codex_bridge import Bridge
+  bridge=Bridge();snapshot={'thread':{'turns':[{'id':'older','status':'completed','items':[{'type':'agentMessage','text':'old answer'}]},{'id':'current','status':'completed','items':[{'type':'agentMessage','text':'final answer'}]}]}}
+  with patch.object(bridge,'rpc',return_value=snapshot):
+   self.assertEqual(bridge.read_turn('thread','current')['text'],'final answer');self.assertIsNone(bridge.read_turn('thread','missing'))
+ def test_completed_codex_turn_is_recovered_when_notification_is_missing(self):
+  import queue
+  j=catalog.job('chat',self.p['id']);events=queue.Queue()
+  with patch.object(engine.bridge,'begin',return_value=('thread','turn',events,'test-model')),patch.object(engine.bridge,'read_turn',return_value={'id':'turn','status':'completed','text':'{"answer":"recovered actual reply"}'}),patch.object(engine,'TURN_POLL_SECONDS',0):
+   result=engine.ask(j['id'],self.p['id'],'Controlled missing notification',{'type':'object'},kind='chat')
+  self.assertEqual(result['answer'],'recovered actual reply');session=catalog.session('paper',self.p['id']);last=catalog.messages(session['id'])[-1];self.assertTrue(last['metadata']['completion_recovered'])
+ def test_unfinished_disk_snapshot_does_not_abort_live_turn(self):
+  import queue
+  j=catalog.job('chat',self.p['id']);events=queue.Queue()
+  snapshots=[{'id':'turn','status':'interrupted','text':''},{'id':'turn','status':'completed','text':'actual completed reply'}]
+  with patch.object(engine.bridge,'begin',return_value=('thread','turn',events,'test-model')),patch.object(engine.bridge,'read_turn',side_effect=snapshots),patch.object(engine,'TURN_POLL_SECONDS',0):
+   result=engine.ask(j['id'],self.p['id'],'Wait for the actual completed turn',kind='chat')
+  self.assertEqual(result,'actual completed reply')
+ def test_previous_turn_notifications_cannot_complete_current_turn(self):
+  import queue
+  events=queue.Queue();events.put({'method':'turn/completed','params':{'turn':{'id':'old','status':'failed'}}});events.put({'method':'item/agentMessage/delta','params':{'turnId':'old','delta':'old text'}});events.put({'method':'item/agentMessage/delta','params':{'turnId':'current','delta':'current reply'}});events.put({'method':'turn/completed','params':{'turn':{'id':'current','status':'completed'}}})
+  j=catalog.job('chat',self.p['id'])
+  with patch.object(engine.bridge,'begin',return_value=('thread','current',events,'test-model')):reply=engine.ask(j['id'],self.p['id'],'Only this turn',kind='chat')
+  self.assertEqual(reply,'current reply')
+ def test_completion_check_is_not_starved_by_unrelated_notifications(self):
+  from unittest.mock import Mock
+  events=Mock();events.get.return_value={'method':'thread/status/changed','params':{}}
+  j=catalog.job('chat',self.p['id'])
+  with patch.object(engine.bridge,'begin',return_value=('thread','turn',events,'test-model')),patch.object(engine.bridge,'read_turn',return_value={'id':'turn','status':'completed','text':'completed reply'}),patch.object(engine.bridge,'interrupt'),patch.object(engine,'TURN_POLL_SECONDS',0),patch.object(engine.time,'monotonic',side_effect=[0,1,2,3,1000]):
+   answer=engine.ask(j['id'],self.p['id'],'Recover even with a busy notification queue',kind='chat')
+  self.assertEqual(answer,'completed reply');events.get.assert_not_called()
+ def test_retry_reuses_only_matching_unanswered_completed_prompt(self):
+  s=catalog.session('paper',self.p['id']);catalog.save_session(s['id'],'thread',model='test-model');catalog.message(s['id'],'user','Same actual task','chat',{'turn_id':'saved-turn'})
+  j=catalog.job('chat',self.p['id'])
+  with patch.object(engine.bridge,'begin') as begin,patch.object(engine.bridge,'read_turn',return_value={'id':'saved-turn','status':'completed','text':'{"answer":"saved native result"}'}) as read:
+   result=engine.ask(j['id'],self.p['id'],'Same actual task',{'type':'object'},kind='chat')
+  begin.assert_not_called();read.assert_called_once_with('thread','saved-turn');self.assertEqual(result['answer'],'saved native result');self.assertEqual(len(catalog.messages(s['id'])),2)
+ def test_completion_inspection_uses_a_separate_read_only_connection(self):
+  import provider_bridge
+  with patch.object(provider_bridge,'Bridge') as factory:
+   reader=factory.return_value;reader.read_turn.return_value={'id':'turn','status':'completed','text':'done'}
+   self.assertEqual(provider_bridge.bridge.read_turn('thread','turn')['text'],'done');reader.read_turn.assert_called_once_with('thread','turn');reader.close.assert_called_once();reader.begin.assert_not_called()
  def test_compact_chat_and_full_transcript(self):
   session=catalog.session('paper',self.p['id']);catalog.message(session['id'],'user','用户追问：hello\n当前三个库：large context','chat');catalog.message(session['id'],'assistant','Visible answer','display');catalog.message(session['id'],'assistant','Page analysis','analysis')
   with TestClient(app) as c:
@@ -99,7 +187,7 @@ class CurrentEdition(unittest.TestCase):
   def rpc(method,params=None):
    calls.append((method,params));return {'thread':{'id':'persisted'}} if method=='thread/resume' else {'turn':{'id':'turn'}}
   with patch.object(b,'rpc',side_effect=rpc):b.begin('continue',thread_id='persisted',persistent=True)
-  self.assertEqual(calls[0],('thread/resume',{'threadId':'persisted'}))
+  self.assertEqual(calls[0][0],'thread/resume');self.assertEqual(calls[0][1]['threadId'],'persisted');self.assertTrue(calls[0][1]['excludeTurns']);self.assertEqual(calls[0][1]['sandbox'],'read-only')
  def test_http_guard_and_removed_routes(self):
   with TestClient(app) as c:
    self.assertEqual(c.get('/api/bootstrap').status_code,200);self.assertEqual(c.get('/').status_code,200);self.assertEqual(c.get('/api/graph').status_code,404);self.assertEqual(c.put('/api/records/paper/'+self.p['id'],json={}).status_code,403)

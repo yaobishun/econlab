@@ -30,7 +30,7 @@ async def local_guard(request,call_next):
 async def bad(request,error):return JSONResponse({'detail':str(error)},409 if 'conflict' in str(error).lower() else 400)
 
 @app.get('/api/bootstrap')
-def bootstrap():return {'version':'3.0.0','data_path':str(store.DATA),'stats':catalog.stats(),'provider':'codex','ocr':False,'model':store.get_setting('model')}
+def bootstrap():return {'version':store.VERSION,'data_path':str(store.DATA),'stats':catalog.stats(),'provider':'codex','ocr':False,'model':store.get_setting('model')}
 @app.get('/api/connection')
 def connection():return bridge.status()
 @app.get('/api/models')
@@ -51,9 +51,9 @@ def settings(body:dict):
 @app.get('/api/papers')
 def papers(q:str=''):return catalog.listing('paper',q)
 @app.post('/api/papers')
-async def import_paper(file:UploadFile=File(...),analyze:bool=Form(True)):
+async def import_paper(file:UploadFile=File(...),analyze:bool=Form(True),complete:bool=Form(True)):
     data=await file.read(store.MAX_FILE+1);paper,duplicate=await asyncio.to_thread(catalog.import_paper,file.filename or '',data)
-    job=engine.submit('analysis',paper['id'],engine.analyze) if analyze and not duplicate else None
+    job=engine.submit('analysis',paper['id'],engine.import_workflow,False,complete) if analyze and not duplicate else None
     return {'paper':paper,'duplicate':duplicate,'job':job}
 @app.delete('/api/papers/{pid}')
 def delete_paper(pid:str):return engine.delete_paper(pid)
@@ -68,7 +68,7 @@ async def asset_upload(pid:str,file:UploadFile|None=File(None),files:list[Upload
         if len(content)>store.MAX_FILE:raise ValueError('Single file exceeds 50 MB')
         payloads.append((item.filename or '',content))
     assets=[catalog.add_asset(pid,name,content,role) for name,content in payloads]
-    job=engine.submit('attachment_sync_'+store.uid(),pid,engine.chat,'一批新附件已导入：'+', '.join(a['name'] for a in assets)+'。请检查全部最新材料，动态更新相关论文、方法和工具记录。已有代码不要无依据改写；需要封装则生成待审核工具，指出缺失输入及参考结果。',True)
+    job=engine.submit('attachment_sync',pid,engine.attachment_workflow,[a['name'] for a in assets])
     return {'asset':assets[0],'assets':assets,'job':job}
 @app.get('/api/assets/{aid}/file')
 def asset_file(aid:str):
@@ -85,13 +85,40 @@ def messages(pid:str):
     recent=[catalog._decode(r) for r in reversed(rows)]
     for m in recent:
         if m['role']=='user':m['text']=m['text'].split('\n当前三个库')[0]
-    return {'session':s,'messages':recent,'total_count':total}
+    execution=catalog.session('paper_agent',pid)
+    return {'session':s,'messages':recent,'total_count':total,'agent_session':execution}
 @app.get('/api/papers/{pid}/transcript')
 def transcript(pid:str):
     catalog.get('paper',pid);s=catalog.session('paper',pid)
-    return JSONResponse({'session':s,'messages':catalog.messages(s['id'])},headers={'Content-Disposition':'attachment; filename="EconLab-conversation-'+pid+'.json"'})
+    execution=catalog.session('paper_agent',pid)
+    return JSONResponse({'session':s,'messages':catalog.messages(s['id']),'agent_session':execution,'agent_messages':catalog.messages(execution['id'])},headers={'Content-Disposition':'attachment; filename="EconLab-conversation-'+pid+'.json"'})
 @app.post('/api/papers/{pid}/analyze')
-def analyze(pid:str,body:dict|None=None):return engine.submit('analysis',pid,engine.analyze,bool((body or {}).get('resume',False)))
+def analyze(pid:str,body:dict|None=None):return engine.submit('analysis',pid,engine.import_workflow,bool((body or {}).get('resume',False)),bool((body or {}).get('complete',True)))
+
+@app.get('/api/papers/{pid}/reproduction')
+def reproduction_state(pid:str):
+    import materials
+    catalog.get('paper',pid);return materials.state(pid)
+
+@app.post('/api/papers/{pid}/reproduction')
+def complete_materials(pid:str,body:dict|None=None):
+    import reproduction
+    body=body or {}
+    if set(body)-{'urls','refresh_search','retry_failed','repair','phase','tool_id','experiment_request'}:raise ValueError('Unknown material workflow option')
+    if not isinstance(body.get('experiment_request',''),str) or len(body.get('experiment_request',''))>4000:raise ValueError('实验与输出目标最多4000字')
+    urls=body.get('urls',[])
+    if not isinstance(urls,list) or any(not isinstance(u,str) for u in urls) or len(urls)>10:raise ValueError('请提供至多10个网址')
+    for key in ('refresh_search','retry_failed','repair'):
+        if key in body and type(body[key]) is not bool:raise ValueError('Invalid workflow option')
+    if body.get('phase','prepare') not in ('prepare','verify'):raise ValueError('Unknown workflow phase')
+    return engine.submit('reproduction',pid,reproduction.complete,body)
+@app.post('/api/papers/{pid}/stop')
+def stop_paper(pid:str):return engine.stop_paper(pid)
+
+@app.get('/api/papers/{pid}/agent')
+def agent_task(pid:str):
+    import execution_agent
+    catalog.get('paper',pid);return execution_agent.latest(pid)
 @app.post('/api/papers/{pid}/chat')
 def chat(pid:str,body:dict):
     text=body.get('text','').strip()
@@ -115,14 +142,30 @@ def create_tool(mid:str,body:dict):
 @app.post('/api/tools/{tid}/validate')
 def validate(tid:str,body:dict):
     tool=catalog.get('tool',tid)
-    return engine.submit('validation',tool['sources'][0]['id'],lambda jid,pid:runner.execute(tid,body.get('inputs',{}),True,pid))
+    return engine.submit('validation',tool['sources'][0]['id'],engine.validate_tool,tid,body.get('inputs',{}))
+
+@app.get('/api/tools/{tid}/environment')
+def environment_status(tid:str):
+    import environments
+    return environments.status(catalog.get('tool',tid))
+
+@app.post('/api/tools/{tid}/environment')
+def environment_prepare(tid:str):
+    import environments
+    tool=catalog.get('tool',tid)
+    return engine.submit('environment',tool['sources'][0]['id'],lambda jid,pid:environments.prepare(tid,lambda:engine.gate(jid,pid)))
 @app.post('/api/tools/{tid}/run')
 def run(tid:str,body:dict):
     tool=catalog.get('tool',tid)
     return engine.submit('calculation',tool['sources'][0]['id'],lambda jid,pid:runner.execute(tid,body.get('inputs',{}),False,pid))
 
 @app.get('/api/records/{kind}/{identifier}')
-def record(kind:str,identifier:str):return catalog.get(kind,identifier)
+def record(kind:str,identifier:str):
+    result=catalog.get(kind,identifier)
+    if kind=='paper':
+        for asset in result['assets']:asset.pop('text',None)
+        for url in result.get('reproduction',{}).get('urls',[]):url.get('result',{}).pop('text',None)
+    return result
 @app.put('/api/records/{kind}/{identifier}')
 def edit(kind:str,identifier:str,body:dict):return catalog.update(kind,identifier,body['patch'],body['revision'],body.get('actor',''),body.get('reason',''),bool(body.get('visual_review',False)))
 @app.post('/api/records/{kind}/{identifier}/review')
