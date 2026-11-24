@@ -39,6 +39,13 @@ vm.runInContext(app.split('\n').find(line=>line.startsWith('async function watch
 sandbox.api=async()=>({status:'failed',stage:'failed',error:'请先完成PDF逐页分析',progress:{}});
 sandbox.watchJob('job','#material-job');await new Promise(r=>setImmediate(r));
 check('failed job remains visible after panel refresh',nodes.get('#material-job').innerHTML.includes('请先完成PDF逐页分析'));
+const draftHtml=sandbox.experimentInventoryHtml({experiment_inventory:{revision:0,eligible:false,counts:{passed:0,required:0},draft:{candidate_count:2,errors:['<bad contract>'],experiments:[{name:'Draft table',figures:['Table 1']}]}}});
+check('invalid inventory draft is visible and cannot appear as accepted',draftHtml.includes('已识别 2 项')&&draftHtml.includes('&lt;bad contract&gt;')&&draftHtml.includes('Draft table')&&!draftHtml.includes('全部必验项通过 · 可用于求解'));
+const autoRequests=[];sandbox.api=async(path,request)=>{if(request){autoRequests.push({path,request});return {id:'auto-job'}}return {status:'failed',error:'fixture stopped'}};
+const autoPaper={...p,reproduction_mode:'automatic',reproduction:{status:'blocked',state:{tool_id:'tool'},events:[],urls:[]}};
+mount(autoPaper);sandbox.wireReproduction(autoPaper);
+await nodes.get('#verify-materials').onclick();
+check('automatic continue never opens mandatory human review',autoRequests[0]?.request.body.phase==='verify');
 const out=process.env.ECONLAB_TEST_OUTPUT;
 if(out)await fs.writeFile(out+'/ui-contract-checks.json',JSON.stringify({kind:'offline DOM contract (not real browser)',checks},null,2));
 console.log(`${checks.length} offline UI checks passed`);

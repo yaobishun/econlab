@@ -61,6 +61,12 @@ def init():
     materials.init()
     import execution_agent
     execution_agent.init()
+    import experiments
+    experiments.init()
+    import automation
+    automation.init()
+    import reproduction_report
+    reproduction_report.init()
 
 
 def clean(value):return re.sub(r'\s+',' ',value or '').strip()
@@ -126,7 +132,13 @@ def listing(kind,q=''):
 def stats():
     with store.db() as c:
         counts={name:c.execute('SELECT count(*) FROM '+name).fetchone()[0] for name in ('papers','methods','tools')}
-        counts['verified_tools']=c.execute("SELECT count(*) FROM tools WHERE validation_status='verified'").fetchone()[0]
+        pids=[r[0] for r in c.execute('SELECT id FROM papers')]
+    import experiments
+    eligible=set()
+    for pid in pids:
+        state=experiments.summary(pid)
+        if state['eligible']:eligible.update(e['tool_id'] for e in state['experiments'] if e['status']=='passed')
+    counts['verified_tools']=len(eligible)
     return counts
 
 
@@ -206,9 +218,17 @@ def check_evidence(paper_id,refs,allow_visual=False):
         if not isinstance(ref,dict) or type(ref.get('page')) is not int or not isinstance(ref.get('quote'),str) or len(clean(ref['quote']))<8:raise ValueError('Evidence requires a PDF page and at least 8 quoted characters')
         pid=ref.get('paper_id') or paper_id
         if pid!=paper_id:raise ValueError('Evidence must belong to the current source paper')
-        p=page(pid,ref['page']);matched=clean(ref['quote']) in clean(p['text'])
+        source=ref.get('asset_id','')
+        if source:
+            a=asset(source)
+            if a['paper_id']!=pid or a['role'] not in ('original','appendix'):raise ValueError('Evidence asset is outside the paper or is not a PDF source')
+            with fitz.open(asset_path(source)) as pdf:
+                if not 1<=ref['page']<=len(pdf):raise ValueError('Evidence page outside source PDF')
+                p={'text':pdf[ref['page']-1].get_text()}
+        else:p=page(pid,ref['page'])
+        matched=clean(ref['quote']) in clean(p['text'])
         if not matched and not allow_visual:raise ValueError('Quotation does not match the PDF text layer; use explicit visual review')
-        result.append({'paper_id':pid,'page':ref['page'],'quote':ref['quote'],'verification':'text' if matched else 'visual'})
+        result.append({'paper_id':pid,'page':ref['page'],'quote':ref['quote'],'verification':'text' if matched else 'visual',**({'asset_id':source} if source else {})})
     return result
 
 
@@ -264,6 +284,7 @@ def create_tool(paper_id,method_id,name,spec,code='',language='python',actor='AI
     import environments
     environments.configuration({'language':language,'spec':spec})
     from runner import VALIDATION_POLICY
+    if 'publication_precision' in spec:raise ValueError('Publication precision belongs to an explicitly authorized experiment plan, never a tool specification')
     if 'validation_policy' in spec and spec['validation_policy']!=VALIDATION_POLICY:raise ValueError('复现验收采用宿主统一标准，不能在工具说明中更改')
     if spec.get('request_mode','file') not in ('file','json'):raise ValueError('request_mode must be file or json')
     authorized={a['id'] for a in get('paper',paper_id)['assets']}
@@ -332,6 +353,7 @@ def update(kind,identifier,patch,expected_revision,actor,reason='',allow_visual=
         environments.configuration({'language':patch.get('language',before['language']),'spec':patch.get('spec',before['spec'])})
         from runner import VALIDATION_POLICY
         value=patch.get('spec',before['spec'])
+        if 'publication_precision' in value:raise ValueError('Publication precision belongs to an explicitly authorized experiment plan, never a tool specification')
         if 'validation_policy' in value and value['validation_policy']!=VALIDATION_POLICY:raise ValueError('复现验收采用宿主统一标准，不能在工具说明中更改')
         if patch.get('spec',before['spec']).get('request_mode','file') not in ('file','json'):raise ValueError('request_mode must be file or json')
         if 'method_id' in patch:

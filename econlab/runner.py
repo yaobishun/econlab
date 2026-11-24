@@ -2,7 +2,7 @@
 Tools execute with the current OS user's permissions; review trusted code before running.
 """
 from __future__ import annotations
-import json, math, os, re, shutil, subprocess, sys, threading
+import copy, json, math, os, re, shutil, subprocess, sys, threading
 from pathlib import Path
 import numpy as np
 from scipy.io import loadmat
@@ -50,8 +50,23 @@ def parameters(spec,values):
         result[key]=v
     return result
 
-def compare(actual,reference,fields,zero_tolerance=None):
+def check_publication_precision(policy,fields):
+    """Explicit, versioned allowances; the execution Agent cannot grant these."""
+    if policy is None:return
+    if not isinstance(policy,dict) or set(policy)!={'rules','reason','authorized_by','evidence'}:raise ValueError('Invalid publication precision policy')
+    if not all(isinstance(policy[k],str) and policy[k].strip() for k in ('reason','authorized_by')) or not policy['evidence']:raise ValueError('Publication precision requires authorization, reason and original evidence')
+    if not isinstance(policy['rules'],list) or not policy['rules']:raise ValueError('Publication precision requires explicit element rules')
+    seen=set()
+    for r in policy['rules']:
+        if not isinstance(r,dict) or set(r)!={'field','index','decimals'} or r['field'] not in fields or type(r['index']) is not int or r['index']<0 or type(r['decimals']) is not int or not 0<=r['decimals']<=12:raise ValueError('Invalid publication precision element rule')
+        pair=(r['field'],r['index'])
+        if pair in seen:raise ValueError('Duplicate publication precision element')
+        seen.add(pair)
+
+
+def compare(actual,reference,fields,zero_tolerance=None,publication_precision=None):
     if not fields:raise ValueError('Specify reference output fields before validation')
+    check_publication_precision(publication_precision,fields)
     if isinstance(zero_tolerance,(int,float)) and not isinstance(zero_tolerance,bool):
         if not math.isfinite(zero_tolerance) or zero_tolerance<0:raise ValueError('Zero-reference tolerance must be finite and nonnegative')
         zero_tolerance={key:zero_tolerance for key in fields}
@@ -73,9 +88,26 @@ def compare(actual,reference,fields,zero_tolerance=None):
         zero=b==0;nonzero=~zero;relative=np.abs((a[nonzero]-b[nonzero])/b[nonzero]);tol=(zero_tolerance or {}).get(key)
         zeros_ok=not zero.any() or tol is not None and np.max(np.abs(a[zero]-b[zero]))<=float(tol)
         maximum=float(relative.max()) if relative.size else None
+        strict=bool(zeros_ok and (maximum is None or maximum<.10))
+        accepted=np.zeros(a.shape,dtype=bool);accepted[nonzero]=relative<.10
+        exceptions=[]
+        for rule in (publication_precision or {}).get('rules',[]):
+            if rule['field']!=key:continue
+            idx=rule['index'];decimals=rule['decimals'];unit=10.0**(-decimals)
+            if idx>=b.size:raise ValueError('Publication precision index outside reference shape')
+            av=float(a.flat[idx]);bv=float(b.flat[idx])
+            if not math.isclose(bv,round(bv,decimals),rel_tol=0,abs_tol=unit*1e-8):raise ValueError('Reference has more digits than declared publication precision')
+            # Zero-reference rules remain governed by the separate absolute tolerance.
+            # Open endpoints avoid accepting a tie outside the stated rounding bin.
+            if bv!=0 and not accepted.flat[idx] and abs(av-bv)<unit/2:
+                accepted.flat[idx]=True
+                exceptions.append({'index':idx,'actual':av,'reference':bv,'decimals':decimals,'absolute_difference':abs(av-bv),'half_unit':unit/2,'relative_error':abs((av-bv)/bv),'reason':publication_precision['reason']})
         report.append({'field':key,'count':a.size,'max_relative_error':maximum,'mean_relative_error':float(relative.mean()) if relative.size else None,
-                       'zero_reference_count':int(zero.sum()),'zero_absolute_tolerance':tol,'passed':bool(zeros_ok and (maximum is None or maximum<.10))})
-    return {'passed':all(r['passed'] for r in report),'threshold':'every nonzero element: relative error strictly < 10%','metrics':report}
+                       'zero_reference_count':int(zero.sum()),'zero_absolute_tolerance':tol,'strict_passed':strict,'publication_precision_acceptances':exceptions,
+                       'passed':bool(zeros_ok and accepted[nonzero].all())})
+    return {'passed':all(r['passed'] for r in report),'strict_passed':all(r.get('strict_passed',False) for r in report),
+            'threshold':'every nonzero element: relative error strictly < 10%'+('; explicitly authorized elements may use the paper rounding interval' if publication_precision else ''),
+            'publication_precision_acceptance_count':sum(len(r.get('publication_precision_acceptances',[])) for r in report),'metrics':report}
 
 def _matlab():
     path=os.environ.get('ECONLAB_MATLAB') or shutil.which('matlab')
@@ -89,18 +121,38 @@ def cancelled(paper_id):
     with LOCK:
         for rid,(pid,proc) in list(ACTIVE.items()):
             if pid==paper_id:
+                if hasattr(proc,'cancel'):proc.cancel();continue
                 if os.name=='nt':subprocess.run(['taskkill','/PID',str(proc.pid),'/T','/F'],capture_output=True)
                 else:proc.kill()
 
-def execute(tool_id,values,validation=False,paper_id=None):
+def execute(tool_id,values,validation=False,paper_id=None,experiment=None):
     tool=catalog.get('tool',tool_id);spec=tool['spec']
+    checked_tool=tool
+    base_fingerprint=catalog.fingerprint(tool)
+    if experiment:
+        # This is an internal host call. Re-read the reviewed plan; never trust
+        # a caller's arbitrary validation configuration or declared signature.
+        import experiments
+        state=experiments.summary(paper_id)
+        frozen=next((e for e in state['experiments'] if e['id']==experiment['id']),None)
+        if not validation or not frozen or not experiments.execution_approved(state,frozen) or frozen['tool_id']!=tool_id or frozen['signature']!=experiment.get('proof_signature'):raise ValueError('Experiment configuration is not currently approved')
+        tool=copy.deepcopy(tool);spec=tool['spec']
+        for key in ('input_asset','reference_asset','validation_fields','zero_tolerance','publication_precision'):spec[key]=frozen.get(key)
+        # Case-specific data replace the solver's default case, not a union of
+        # unrelated inputs that happen to share filenames.
+        code_ids=set(spec.get('code_assets',[]))|set(spec.get('author_code_assets',[]))
+        spec['asset_ids']=list(code_ids|set(frozen['asset_ids'])|set(frozen['bundle_paths']))
+        spec['bundle_paths']={**{aid:path for aid,path in spec.get('bundle_paths',{}).items() if aid in code_ids},**frozen['bundle_paths']}
+        spec['validation_scope']=frozen['name']
+        values=frozen['parameters']
     if not tool['code']:raise ValueError('This method has no executable code yet')
-    if tool['review_status']!='confirmed':raise ValueError('Review the tool code and configuration before execution')
+    import automation
+    if not automation.allowed('tool',checked_tool):raise ValueError('Complete automatic code checks or human review before execution')
     if not validation and catalog.get('method',tool['method_id'])['review_status']=='disputed':raise ValueError('Resolve the disputed method review before using it for a new problem')
-    fingerprint=catalog.fingerprint(tool)
+    fingerprint=experiment['proof_signature'] if experiment else base_fingerprint
     if not validation:
-        with store.db() as c:proof=c.execute("SELECT id FROM runs WHERE tool_id=? AND kind='validation' AND status='passed' AND fingerprint=?",(tool_id,fingerprint)).fetchone()
-        if tool['validation_status']!='verified' or not proof:raise ValueError('Current tool version has not passed reproduction validation')
+        import experiments
+        experiments.require_eligible(tool)
     elif not spec.get('input_asset') or not spec.get('reference_asset'):raise ValueError('Real input data and independent reference results are required')
     if validation:
         code_sources=spec.get('code_assets',[]) or spec.get('author_code_assets',[])
@@ -121,6 +173,7 @@ def execute(tool_id,values,validation=False,paper_id=None):
         c.execute('INSERT INTO runs VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',(rid,tool_id,tool['revision'],paper_id,'validation' if validation else 'calculation','running',store.encode(inputs),'{}',fingerprint,spec.get('validation_scope',''),now,now))
     method=catalog.get('method',tool['method_id'])
     result={'run_id':rid,'tool_revision':tool['revision'],'method_id':method['id'],'method_revision':method['revision'],'code_sha256':store.digest(tool['code'].encode('utf-8')),'fingerprint':fingerprint,'scope':spec.get('validation_scope',''),'inputs':inputs,'started':now,'validation_policy':VALIDATION_POLICY}
+    if spec.get('publication_precision'):result['validation_policy']={**VALIDATION_POLICY,'publication_precision':spec['publication_precision']}
     proc=None
     try:
         authorized={a['id'] for p in tool['sources'] for a in catalog.get('paper',p['id'])['assets']}
@@ -142,6 +195,11 @@ def execute(tool_id,values,validation=False,paper_id=None):
                 if target in targets and targets[target]!=aid:raise ValueError('Different source assets map to the same file path; resolve the version conflict')
                 targets[target]=aid;target.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(catalog.asset_path(aid),target);copied.setdefault(aid,target)
         request=root/'request.json';output=root/('result.mat' if tool['language']=='matlab' else 'result.json')
+        for dep in (experiment or {}).get('dependency_outputs',[]):
+            target=(root/dep['path']).resolve()
+            if not target.is_relative_to(root) or target in targets or target.exists():raise ValueError('Dependency output conflicts with an input or runtime path')
+            target.parent.mkdir(parents=True,exist_ok=True);target.write_text(store.encode(dep['outputs']),encoding='utf-8')
+        if experiment:result['experiment']={'id':experiment['id'],'dependencies':[{k:d[k] for k in ('path','run_id')} for d in experiment.get('dependency_outputs',[])]}
         payload={**inputs,'validation':validation} if spec.get('source_kind')=='author_adapter' else inputs
         request.write_text(store.encode(payload),encoding='utf-8')
         if tool['language']=='matlab':
@@ -164,36 +222,49 @@ def execute(tool_id,values,validation=False,paper_id=None):
         import environments
         result['runtime']={'language':tool['language'],'executable':cmd[0],'python_version':sys.version if tool['language']=='python' else None,'environment':environments.status(tool)}
         flags={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
-        with (root/'stdout.log').open('w',encoding='utf-8') as log,(root/'stderr.log').open('w',encoding='utf-8') as err:
-            proc=subprocess.Popen(cmd,cwd=root,env=env,stdout=log,stderr=err,**flags)
+        if tool['review_status']!='confirmed':
+            from sandbox_runtime import Command
+            proc=Command(root)
             with LOCK:ACTIVE[rid]=(paper_id,proc)
-            try:code=proc.wait(timeout=min(int(spec.get('timeout_seconds',1800)),3600))
-            except subprocess.TimeoutExpired:
-                cancelled(paper_id);raise ValueError('Execution timed out')
+            response=proc.execute(cmd,env,min(int(spec.get('timeout_seconds',1800)),3600))
+            code=response['exitCode'];result['runtime']['sandbox']='codex_workspace_write_no_network'
+            (root/'stdout.log').write_text(response['stdout'],encoding='utf-8');(root/'stderr.log').write_text(response['stderr'],encoding='utf-8')
+        else:
+            with (root/'stdout.log').open('w',encoding='utf-8') as log,(root/'stderr.log').open('w',encoding='utf-8') as err:
+                proc=subprocess.Popen(cmd,cwd=root,env=env,stdout=log,stderr=err,**flags)
+                with LOCK:ACTIVE[rid]=(paper_id,proc)
+                try:code=proc.wait(timeout=min(int(spec.get('timeout_seconds',1800)),3600))
+                except subprocess.TimeoutExpired:
+                    cancelled(paper_id);raise ValueError('Execution timed out')
         result['exit_code']=code
         result['stdout']=(root/'stdout.log').read_text(encoding='utf-8',errors='replace')[-20000:]
         result['stderr']=(root/'stderr.log').read_text(encoding='utf-8',errors='replace')[-12000:]
         if code:raise ValueError('Tool program failed; inspect the execution logs')
         if not output.is_file():raise ValueError('Tool did not write its declared result file')
         actual=loadmat(output,mat_dtype=True) if tool['language']=='matlab' else json.loads(output.read_text(encoding='utf-8'))
+        result['outputs']={k:jsonable(v) for k,v in actual.items() if not k.startswith('__')}
         if validation:
             refpath=catalog.asset_path(spec['reference_asset'])
             reference=loadmat(refpath,mat_dtype=True) if refpath.suffix.lower()=='.mat' else json.loads(refpath.read_text(encoding='utf-8-sig'))
-            result['comparison']=compare(actual,reference,spec.get('validation_fields'),spec.get('zero_tolerance'))
+            result['comparison']=compare(actual,reference,spec.get('validation_fields'),spec.get('zero_tolerance'),spec.get('publication_precision'))
             result['passed']=result['comparison']['passed']
+            if experiment and experiment.get('kind')=='curve':
+                import experiments
+                result['curve_comparison']=experiments.curve_compare(actual,experiment['curve_checks'])
+                result['passed']=result['passed'] and result['curve_comparison']['passed']
         else:
             result['outputs']={k:jsonable(v) for k,v in actual.items() if not k.startswith('__')}
         status='passed' if result.get('passed',True) else 'failed'
         current=catalog.get('tool',tool_id)
-        if catalog.fingerprint(current)!=fingerprint:raise ValueError('Tool or method changed during execution; this result cannot validate the new version')
-        if validation:
+        if catalog.fingerprint(current)!=base_fingerprint:raise ValueError('Tool or method changed during execution; this result cannot validate the new version')
+        if validation and not experiment:
             with store.db() as c:c.execute('UPDATE tools SET validation_status=?,updated=? WHERE id=? AND revision=?',('verified' if status=='passed' else 'failed',store.now(),tool_id,tool['revision']))
             if status=='passed':catalog.supersede_candidates(tool_id)
     except Exception as e:
         status='failed';result['error']=str(e)
         # A failed rerun must revoke execution eligibility for this exact version.
         # Concurrent edits/deletion retain their own invalidation state.
-        if validation:
+        if validation and not experiment:
             try:
                 current=catalog.get('tool',tool_id)
                 if catalog.fingerprint(current)==fingerprint:

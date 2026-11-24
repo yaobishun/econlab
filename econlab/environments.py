@@ -6,6 +6,15 @@ import catalog,store
 
 PACKAGE=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[[A-Za-z0-9_,.-]+\])?(?:(?:==|>=|<=|>|<|~=|!=)[A-Za-z0-9_.+*-]+(?:,(?:>=|<=|>|<|!=)[A-Za-z0-9_.+*-]+)*)?')
 
+def available():
+    """Read-only discovery; installation does not imply an available license."""
+    import runner
+    value={'python':{'executable':sys.executable,'version':sys.version},'matlab':{'installed':False,'license_checked':False}}
+    try:value['matlab'].update(installed=True,executable=runner._matlab())
+    except ValueError:pass
+    return value
+
+
 def configuration(tool):
     value=tool['spec'].get('environment',{})
     if not isinstance(value,dict):raise ValueError('Environment must be an object')
@@ -35,7 +44,8 @@ def python(tool):
 
 def prepare(tool_id,check=lambda:None):
     tool=catalog.get('tool',tool_id)
-    if tool['review_status']!='confirmed':raise ValueError('先人工审核代码及依赖配置，再准备运行环境')
+    import automation
+    if not automation.allowed('tool',tool):raise ValueError('先完成代码及依赖配置的自动检查或人工审核，再准备运行环境')
     config=configuration(tool);folder=root(tool);folder.mkdir(parents=True,exist_ok=True);manifest=folder/'environment.json'
     before=store.digest({'revision':tool['revision'],'spec':tool['spec'],'code':tool['code'],'method_revision':catalog.get('method',tool['method_id'])['revision']})
     previous=status(tool);result={'status':'preparing','configuration':config,'tool_id':tool_id,'started':store.now()}

@@ -4,6 +4,7 @@ from unittest.mock import patch
 import fitz
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import catalog,store,runner,engine
+from fixture_inventory import approve_fixture
 from fastapi.testclient import TestClient
 from app import app
 
@@ -11,7 +12,7 @@ def pdf(text):
  d=fitz.open();p=d.new_page();p.insert_text((50,50),text);v=d.tobytes();d.close();return v
 class CurrentEdition(unittest.TestCase):
  def setUp(self):
-  self.old=store.DATA;self.root=store.ROOT/'.local'/'checks'/store.uid();self.root.mkdir(mode=0o777,parents=True);store.DATA=self.root;catalog.init();self.p,_=catalog.import_paper('first.pdf',pdf('The spatial equilibrium model assumes free labor mobility.'))
+  self.old=store.DATA;self.root=store.ROOT/'.local'/'checks'/store.uid();self.root.mkdir(mode=0o777,parents=True);store.DATA=self.root;catalog.init();store.set_setting("reproduction_mode","manual");self.p,_=catalog.import_paper('first.pdf',pdf('The spatial equilibrium model assumes free labor mobility.'))
  def tearDown(self):
   store.DATA=self.old
   if self.root.resolve().is_relative_to(store.ROOT/'.local'/'checks'):shutil.rmtree(self.root)
@@ -55,7 +56,7 @@ class CurrentEdition(unittest.TestCase):
  def test_execution_validation_and_invalidation(self):
   t=self.tool()
   with self.assertRaises(ValueError):runner.execute(t['id'],{})
-  r=runner.execute(t['id'],{},True);self.assertEqual(r['status'],'passed',r);self.assertEqual(runner.execute(t['id'],{'x':90})['status'],'passed');r=catalog.update('tool',t['id'],{'code':t['code']+'\n# edited'},t['revision'],'Editor');self.assertNotEqual(r['validation_status'],'verified');self.assertEqual(r['review_status'],'draft')
+  r=runner.execute(t['id'],{},True);self.assertEqual(r['status'],'passed',r);approve_fixture(t);self.assertEqual(runner.execute(t['id'],{'x':90})['status'],'passed');r=catalog.update('tool',t['id'],{'code':t['code']+'\n# edited'},t['revision'],'Editor');self.assertNotEqual(r['validation_status'],'verified');self.assertEqual(r['review_status'],'draft')
  def test_asset_scope(self):
   t=self.tool();p2,_=catalog.import_paper('other.pdf',pdf('Another paper'));a=catalog.add_asset(p2['id'],'x.json',b'{}','data')
   with self.assertRaises(ValueError):catalog.update('tool',t['id'],{'spec':{**t['spec'],'input_asset':a['id']}},t['revision'],'Editor')
@@ -81,7 +82,7 @@ class CurrentEdition(unittest.TestCase):
  def test_restore_creates_new_revision(self):
   p=catalog.update('paper',self.p['id'],{'title':'Changed'},1,'Editor');restored=catalog.restore('paper',p['id'],1,2,'Editor');self.assertEqual(restored['title'],self.p['title']);self.assertEqual(restored['revision'],3)
  def test_solver_receives_actual_current_validation_proof(self):
-  t=self.tool();run=runner.execute(t['id'],{},True);self.assertEqual(run['status'],'passed')
+  t=self.tool();run=approve_fixture(t);self.assertEqual(run['status'],'passed')
   def answer(jid,pid,prompt,schema,**kwargs):
    self.assertIn('validation_proof',prompt);self.assertIn(run['run_id'],prompt)
    return {'explanation':'test plan','selected_method_id':t['method_id'],'selected_tool_id':t['id'],'missing_information':[],'applicability':[],'parameters_json':'{}'}
@@ -98,6 +99,7 @@ class CurrentEdition(unittest.TestCase):
   code="# Output is a finite-change decomposition, not an exact income ratio.\ndef run(inputs,workspace):\n return {'answer':[i+1.234567 for i in range(34)],'countries':['C%02d'%i for i in range(34)]}\n"
   t=catalog.update('tool',t['id'],{'code':code,'spec':{**t['spec'],'reference_asset':ref['id'],'asset_ids':[*t['spec']['asset_ids'],ref['id']]}},t['revision'],'Tester');catalog.review('tool',t['id'],'confirmed','Tester','Controlled output-context fixture',t['revision'])
   self.assertEqual(runner.execute(t['id'],{},True)['status'],'passed')
+  approve_fixture(t)
   chosen={'explanation':'Fixture plan','selected_method_id':t['method_id'],'selected_tool_id':t['id'],'missing_information':[],'applicability':[],'parameters_json':'{}'}
   j=catalog.job('solve')
   with patch.object(engine,'ask',return_value=chosen):plan=engine.solve_plan(j['id'],None,'trade welfare',{})
@@ -112,7 +114,7 @@ class CurrentEdition(unittest.TestCase):
   summary=engine.explanation_outputs(values,budget=100)
   self.assertEqual(summary['countries'],values['countries']);self.assertTrue(summary['values']['truncated']);self.assertEqual(summary['values']['max'],19999);self.assertEqual(len(values['values']),20000)
  def test_unprovided_citation_rejects_explanation_but_keeps_actual_result(self):
-  t=self.tool();self.assertEqual(runner.execute(t['id'],{},True)['status'],'passed')
+  t=self.tool();self.assertEqual(approve_fixture(t)['status'],'passed')
   chosen={'explanation':'Fixture plan','selected_method_id':t['method_id'],'selected_tool_id':t['id'],'missing_information':[],'applicability':[],'parameters_json':'{}'}
   j=catalog.job('solve')
   with patch.object(engine,'ask',return_value=chosen):plan=engine.solve_plan(j['id'],None,'trade welfare',{})

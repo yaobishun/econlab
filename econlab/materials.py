@@ -243,10 +243,11 @@ def fetch(pid,url,check=lambda:None,retry=False):
     event(pid,'fetch_'+status,{k:v for k,v in receipt.items() if k not in ('text','links')})
     return receipt
 
-def inventory(pid):
+def inventory(pid,asset_ids=None):
     """Bounded content/schema snapshots; binary inputs remain real local assets."""
     result=[]
     for a in catalog.get('paper',pid)['assets']:
+        if asset_ids is not None and a['id'] not in asset_ids:continue
         row={k:a[k] for k in ('id','name','role','sha256','metadata')};path=catalog.asset_path(a['id']);s=path.suffix.lower()
         try:
             if s=='.mat':
@@ -266,6 +267,17 @@ def inventory(pid):
                     if k in row['variables'] and hasattr(v,'dtype') and v.size<=64 and v.dtype.kind in 'biuf':
                         if np.isfinite(v).all():row['variables'][k]['value']=v.tolist()
                         else:row['variables'][k]['inspection_note']='输入含非有限数值，保留原件，需明确缺失值处理规则；不猜测数值。'
+            elif s=='.npz':
+                import zipfile,numpy as np
+                row['variables']={}
+                with zipfile.ZipFile(path) as archive:
+                    for name in archive.namelist():
+                        if not name.endswith('.npy'):continue
+                        with archive.open(name) as stream:
+                            version=np.lib.format.read_magic(stream)
+                            shape,fortran,dtype=np.lib.format._read_array_header(stream,version)
+                        row['variables'][name[:-4]]={'shape':list(shape),'dtype':str(dtype),'fortran_order':fortran}
+                row['inspection_note']='Array headers inspected without loading arrays or executing pickle payloads'
             elif s=='.json' and a['metadata']['size']<200000:row['preview']=a['text'][:8000]
             elif s in ('.pkl','.pickle'):
                 # Read opcode strings only. Unpickling is code execution and belongs

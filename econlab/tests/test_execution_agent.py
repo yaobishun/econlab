@@ -28,6 +28,7 @@ class ExecutionTask(unittest.TestCase):
    calls.append((name,params));return {'thread':{'id':'test'}} if name.startswith('thread/') else {'turn':{'id':'turn'}}
   with patch.object(client,'rpc',side_effect=rpc):client.begin('Inspect files',persistent=True,task=self.task.configuration())
   start=calls[0][1];self.assertEqual(start['sandbox'],'workspace-write');self.assertEqual(start['runtimeWorkspaceRoots'],[str(self.task.root)]);self.assertEqual(start['config']['web_search'],'live');self.assertFalse(start['config']['sandbox_workspace_write']['network_access']);self.assertEqual(len(start['dynamicTools']),4)
+  turn=calls[1][1];self.assertEqual(turn['cwd'],str(self.task.root));self.assertEqual(turn['runtimeWorkspaceRoots'],[str(self.task.root)]);self.assertEqual(turn['sandboxPolicy']['writableRoots'],[str(self.task.root)])
   with self.assertRaises(ValueError):Bridge('agent').begin('Unscoped execution')
  def test_references_are_not_staged_and_raw_copy_tampering_is_detected(self):
   rows=self.task.stage();r=next(v for v in rows if v['id']==self.ref['id']);self.assertIsNone(r['path'])
@@ -63,7 +64,9 @@ class ExecutionTask(unittest.TestCase):
   sibling=self.task.root.parent.parent/'0123456789abcdef'
   sibling.mkdir();(sibling/'keep.txt').write_text('keep')
   session=catalog.session('paper_agent',self.pid);catalog.save_session(session['id'],'native-task-thread')
-  engine.delete_paper(self.pid);self.assertFalse(self.task.root.exists());self.assertTrue((sibling/'keep.txt').exists());self.assertIsNone(agent.latest(self.pid))
+  with patch.object(engine.bridge,'rpc',return_value={}) as archive:engine.delete_paper(self.pid)
+  archive.assert_called_with('thread/archive',{'threadId':'native-task-thread'})
+  self.assertFalse(self.task.root.exists());self.assertTrue((sibling/'keep.txt').exists());self.assertIsNone(agent.latest(self.pid))
  def test_native_command_failure_and_success_are_recorded_as_real_events(self):
   self.task.on_event({'method':'item/completed','params':{'item':{'id':'cmd1','type':'commandExecution','command':'python adapters/check.py','exitCode':1,'status':'failed','aggregatedOutput':'field missing'}}})
   state=agent.get(self.task.id)['state'];self.assertEqual(state['execution_count'],1)
@@ -117,5 +120,31 @@ class ExecutionTask(unittest.TestCase):
   self.assertIn('actual fixture adapter failure',feedback['result']['stderr']);self.assertEqual(feedback['tool_revision'],tool['revision'])
   self.assertTrue(feedback['files']);self.assertTrue(any(f['path'].endswith('stderr.log') for f in feedback['files']))
   self.assertFalse(any(p.name=='ref.json' for p in (self.task.root/'logs'/'formal-runs').rglob('*')))
+
+ def test_codex_failure_returns_json_instead_of_generic_server_error(self):
+  with TestClient(app) as client,patch('app.bridge.models',side_effect=RuntimeError('Codex startup permission denied')):
+   response=client.get('/api/models')
+  self.assertEqual(response.status_code,503);self.assertEqual(response.json()['detail'],'Codex startup permission denied')
+ def test_native_startup_permission_error_keeps_diagnostic_log(self):
+  import codex_bridge
+  from types import SimpleNamespace
+  client=codex_bridge.Bridge()
+  def launch(*args,**kwargs):
+   kwargs['stderr'].write(b'Error: Permission denied (os error 5)\n');kwargs['stderr'].flush()
+   return SimpleNamespace(poll=lambda:1,stdout=[])
+  with patch.object(codex_bridge,'executable',return_value=['codex']),patch.object(codex_bridge.subprocess,'Popen',side_effect=launch),patch.object(client,'_rpc',side_effect=RuntimeError('process exited')):
+   with self.assertRaisesRegex(RuntimeError,'访问本机运行目录被拒绝'):client.start()
+  self.assertIn('os error 5',(store.DATA/'codex-chat.log').read_text())
+
+ def test_pre_pin_inspection_is_draft_not_a_completed_tool(self):
+  before=[t['id'] for t in catalog.get('paper',self.pid)['tools']]
+  path=self.task.root/'logs'/'source-inspection.json';path.write_text('{"missing":"original data"}')
+  asset=self.task.publish({'path':'logs/source-inspection.json','role':'derivation','reason':'Record real missing source','source_assets':[self.data['id']],'evidence':self.refs})
+  record=catalog.asset(asset['id']);self.assertTrue(record['metadata']['pre_pin']);self.assertEqual(record['metadata']['provenance'],'agent_inspection_artifact')
+  self.assertIsNone(agent.get(self.task.id)['state'].get('pin'))
+  import reproduction
+  with self.assertRaisesRegex(ValueError,'independent reference'):
+   reproduction.derive(self.pid,{'operation':'json_fields','source_asset':asset['id'],'name':'fake-ref.json','role':'reference','fields':['missing'],'values_json':'{}','evidence':self.refs,'reason':'Cannot self-reference a generated result'})
+  self.assertEqual([t['id'] for t in catalog.get('paper',self.pid)['tools']],before)
 
 if __name__=='__main__':unittest.main()

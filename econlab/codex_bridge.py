@@ -73,10 +73,18 @@ class Bridge:
                 if key.startswith('DEEPSEEK_') or key in ('OPENAI_API_KEY','CODEX_API_KEY','AGENT_LAB_LLM_PROVIDER'):
                     env.pop(key,None)
             flags={'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}
-            self.proc=subprocess.Popen(cmd,cwd=store.DATA/'agent-workspace',stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True,encoding='utf-8',bufsize=1,env=env,**flags)
+            log_path=store.DATA/('codex-'+self.mode+'.log')
+            with log_path.open('ab') as diagnostic:
+                self.proc=subprocess.Popen(cmd,cwd=store.DATA/'agent-workspace',stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=diagnostic,text=True,encoding='utf-8',bufsize=1,env=env,**flags)
             self.initialized=False
             threading.Thread(target=self._read,args=(self.proc,),daemon=True).start()
-            self._rpc('initialize',{'clientInfo':{'name':'econlab_local','title':'EconLab','version':store.VERSION},'capabilities':{'experimentalApi':True}},30)
+            try:self._rpc('initialize',{'clientInfo':{'name':'econlab_local','title':'EconLab','version':store.VERSION},'capabilities':{'experimentalApi':True}},30)
+            except RuntimeError as exc:
+                if self.proc.poll() is None:raise
+                tail=log_path.read_bytes()[-5000:].decode('utf-8',errors='replace')
+                if any(token in tail.lower() for token in ('permission denied','access is denied','os error 5','拒绝访问')):
+                    raise RuntimeError('Codex 启动失败：访问本机运行目录被拒绝。请从普通 PowerShell 重启 EconLab；诊断日志：'+log_path.name) from exc
+                raise RuntimeError('Codex 子进程启动失败；诊断日志：'+log_path.name) from exc
             self.send({'method':'initialized','params':{}})
             self.initialized=True
 
@@ -180,6 +188,11 @@ class Bridge:
         if task:self.tool_handlers[identifier]=task['handler']
         try:
             params={'threadId':identifier,'input':inputs,'effort':'medium'}
+            if task:
+                # Resuming an already loaded thread can ignore thread/resume
+                # overrides. Apply the new experiment workspace at turn/start.
+                params.update(cwd=str(cwd),runtimeWorkspaceRoots=[str(cwd)],approvalPolicy='never',
+                    sandboxPolicy={'type':'workspaceWrite','writableRoots':[str(cwd)],'networkAccess':False,'excludeTmpdirEnvVar':True,'excludeSlashTmp':True})
             if output_schema is not None: params['outputSchema']=output_schema
             turn=self.rpc('turn/start',params)
         except Exception:

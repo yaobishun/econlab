@@ -4,6 +4,8 @@ from unittest.mock import patch
 import fitz,httpx
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import catalog,store,materials,reproduction,runner,environments,engine
+from fixture_inventory import approve_fixture
+import execution_agent
 from fastapi.testclient import TestClient
 from app import app
 
@@ -33,10 +35,10 @@ class ReproductionWorkflow(unittest.TestCase):
  def test_independent_implementation_passes_same_gate_without_author_code(self):
   t=self.tool();result=runner.execute(t['id'],{},True)
   self.assertEqual(result['status'],'passed',result);self.assertEqual(catalog.get('tool',t['id'])['validation_status'],'verified')
-  root=store.DATA/'runs'/result['run_id'];self.assertFalse((root/'reference.json').exists());self.assertEqual(runner.execute(t['id'],{},False)['status'],'passed')
+  root=store.DATA/'runs'/result['run_id'];self.assertFalse((root/'reference.json').exists());approve_fixture(t);self.assertEqual(runner.execute(t['id'],{},False)['status'],'passed')
  def test_new_calculation_does_not_receive_a_validation_switch(self):
   t=self.tool();code=t['code'].replace(" assert not (workspace/'reference.json').exists()"," assert 'validation' not in inputs\n assert not (workspace/'reference.json').exists()")
-  t=catalog.update('tool',t['id'],{'code':code},t['revision'],'Tester');catalog.review('tool',t['id'],'confirmed','Tester','Same calculation for validation and real use',t['revision']);self.assertEqual(runner.execute(t['id'],{},True)['status'],'passed');self.assertEqual(runner.execute(t['id'],{},False)['status'],'passed')
+  t=catalog.update('tool',t['id'],{'code':code},t['revision'],'Tester');catalog.review('tool',t['id'],'confirmed','Tester','Same calculation for validation and real use',t['revision']);self.assertEqual(runner.execute(t['id'],{},True)['status'],'passed');approve_fixture(t);self.assertEqual(runner.execute(t['id'],{},False)['status'],'passed')
  def test_matlab_json_argument_preserves_quotes_and_backslashes(self):
   from scipy.io import savemat
   from types import SimpleNamespace
@@ -88,16 +90,16 @@ class ReproductionWorkflow(unittest.TestCase):
   assessment={'summary':'Exact controlled cube','method_id':m['id'],'experiment':'x=2, y=x cubed','version_notes':[],'selected_asset_ids':t['spec']['asset_ids'],'derivations':[],'paper_card_updates':[],'gaps':[]}
   built={'summary':'Implemented from equation','method_id':m['id'],'tool_id':t['id'],'name':'Prepared cube','language':'python','code':t['code'],'spec_json':store.encode({**t['spec'],'environment':{'requirements':[]}}),'gaps':[]}
   j=catalog.job('prepare-chain',p)
-  with patch.object(engine,'ask',side_effect=self.agent_reply(built)):r=reproduction.complete(j['id'],p)
+  with patch.object(engine,'ask',side_effect=self.agent_reply(built)):r=execution_agent.prepare(j['id'],p)
   self.assertEqual(r['status'],'awaiting_review');prepared=catalog.get('tool',t['id']);self.assertEqual(prepared['review_status'],'draft');self.assertTrue(prepared['spec']['code_assets']);self.assertEqual(catalog.get('method',m['id'])['revision'],m['revision'])
   catalog.review('tool',prepared['id'],'confirmed','Tester','Checked actual input, reference, generated implementation and equation',prepared['revision'])
   verified=reproduction.verify(j['id'],p,prepared['id']);self.assertEqual(verified['status'],'verified');self.assertEqual(catalog.get('tool',prepared['id'])['validation_status'],'verified');self.assertEqual(catalog.get('method',m['id'])['reproduction_plans'][0]['plan']['experiment'],'x=2, y=x cubed')
  def test_continue_does_not_rewrite_a_current_verified_tool(self):
-  t=self.tool();self.assertEqual(runner.execute(t['id'],{},True)['status'],'passed')
+  t=self.tool();self.assertEqual(approve_fixture(t)['status'],'passed')
   with store.db() as c:c.execute('UPDATE papers SET coverage=? WHERE id=?',(store.encode({'completed':store.now()}),self.p['id']))
   j=catalog.job('continue',self.p['id'])
   with patch.object(engine,'ask') as ask:r=reproduction.complete(j['id'],self.p['id'])
-  self.assertEqual(r['status'],'verified');ask.assert_not_called();self.assertEqual(catalog.get('tool',t['id'])['revision'],t['revision']);self.assertEqual(catalog.get('tool',t['id'])['validation_status'],'verified')
+  self.assertEqual(r['status'],'complete');ask.assert_not_called();self.assertEqual(catalog.get('tool',t['id'])['revision'],t['revision'])
  def test_archive_paths_and_sources(self):
   out=io.BytesIO()
   with zipfile.ZipFile(out,'w') as z:z.writestr('repo/functions/model.py','def model(x): return x**3')
@@ -156,14 +158,14 @@ class ReproductionWorkflow(unittest.TestCase):
   built={'method_id':m['id'],'tool_id':t['id'],'name':'Prepared cube','language':'python','code':t['code'],'spec_json':store.encode(spec),'summary':'Prepared controlled fixture','gaps':[]}
   j=catalog.job('prepare',self.p['id']);result=reproduction.save_prepared(j['id'],self.p['id'],built,m['id'],[t],m['revision'])
   self.assertEqual(result['status'],'awaiting_review');saved=catalog.get('tool',t['id']);self.assertEqual(saved['spec']['parameters'],[]);self.assertIsInstance(saved['spec']['bundle_paths'],dict);self.assertEqual(saved['review_status'],'draft')
- def test_pending_implementation_resumes_without_repeating_material_search(self):
-  t=self.tool();m=catalog.get('method',t['method_id'])
+ def test_old_single_task_state_cannot_bypass_full_inventory(self):
+  t=self.tool()
   with store.db() as c:c.execute('UPDATE papers SET coverage=? WHERE id=?',(store.encode({'completed':store.now()}),self.p['id']))
-  materials.progress(self.p['id'],'blocked','Transport interrupted',assessment={'method_id':m['id']},experiment_request='Controlled cube')
-  s=catalog.session('paper',self.p['id']);catalog.message(s['id'],'user','Previously submitted implementation request','implementation',{'turn_id':'saved-turn'})
-  built={'method_id':m['id'],'tool_id':t['id'],'name':'Resumed cube','language':'python','code':t['code'],'spec_json':store.encode(t['spec']),'summary':'Recovered implementation','gaps':[]};j=catalog.job('resume',self.p['id'])
-  with patch.object(reproduction,'acquire') as acquire,patch.object(engine,'ask',return_value=built) as ask:result=reproduction.complete(j['id'],self.p['id'])
-  acquire.assert_not_called();self.assertEqual(ask.call_args.args[2],'Previously submitted implementation request');self.assertEqual(result['status'],'awaiting_review')
+  materials.progress(self.p['id'],'verified','Historical single experiment passed',tool_id=t['id'])
+  j=catalog.job('resume',self.p['id'])
+  with patch.object(engine,'ask',side_effect=ValueError('complete inventory required')):
+   with self.assertRaisesRegex(ValueError,'complete inventory'):reproduction.complete(j['id'],self.p['id'])
+  self.assertEqual(catalog.get('tool',t['id'])['revision'],t['revision'])
  def test_environment_requires_review_and_rejects_shell_installers(self):
   t=self.tool()
   with self.assertRaises(ValueError):catalog.update('tool',t['id'],{'spec':{**t['spec'],'environment':{'requirements':['numpy; whoami']}}},t['revision'],'Tester')
@@ -184,6 +186,7 @@ class ReproductionWorkflow(unittest.TestCase):
  def test_tool_text_cannot_redefine_the_host_acceptance_policy(self):
   t=self.tool()
   with self.assertRaises(ValueError):catalog.update('tool',t['id'],{'spec':{**t['spec'],'validation_policy':{**runner.VALIDATION_POLICY,'relative_error_limit':.2}}},t['revision'],'Tester')
+  with self.assertRaises(ValueError):catalog.update('tool',t['id'],{'spec':{**t['spec'],'publication_precision':{}}},t['revision'],'Tester')
  def test_matlab_diagnostics_are_serializable_and_complex_results_fail(self):
   import numpy as np
   a=np.zeros((1,1),dtype=[('residual','O')]);a['residual'][0,0]=np.array([[1e-10]])
@@ -207,5 +210,16 @@ class ReproductionWorkflow(unittest.TestCase):
    self.assertEqual(c.post('/api/papers/'+self.p['id']+'/reproduction',headers={'X-EconLab':'1'},json={'urls':'not a list'}).status_code,400)
    self.assertEqual(c.post('/api/papers/'+self.p['id']+'/reproduction',headers={'X-EconLab':'1'},json={'phase':'execute arbitrary command'}).status_code,400)
   t=self.tool();j=catalog.job('reproduction',self.p['id']);u=catalog.update('tool',t['id'],{'name':'Edited cube'},t['revision'],'Tester');r=reproduction.verify(j['id'],self.p['id'],u['id']);self.assertEqual(r['status'],'awaiting_review');self.assertEqual(catalog.get('tool',u['id'])['runs'],[])
+
+ def test_selected_npz_inspection_reads_headers_without_unpickling(self):
+  import numpy as np
+  blob=io.BytesIO();np.savez(blob,flows=np.ones((2,3,4)),opaque=np.array([object()],dtype=object))
+  asset=self.asset('schema.npz',blob.getvalue(),'data')
+  with patch.object(np,'load',side_effect=AssertionError('Do not load array payloads during schema inspection')):
+   rows=materials.inventory(self.p['id'],{asset['id']})
+  self.assertEqual(len(rows),1);row=rows[0]
+  self.assertEqual(row['variables']['flows']['shape'],[2,3,4])
+  self.assertEqual(row['variables']['opaque']['dtype'],'object')
+  self.assertNotIn('value',row['variables']['opaque'])
 
 if __name__=='__main__':unittest.main()

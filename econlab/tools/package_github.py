@@ -24,13 +24,13 @@ APP_FILES = (
     '.gitignore', 'requirements.txt', 'start.cmd', 'start.ps1', 'stop.ps1',
     'app.py', 'catalog.py', 'codex_bridge.py', 'engine.py', 'pdf_visual.py',
     'provider_bridge.py', 'runner.py', 'store.py', 'materials.py',
-    'reproduction.py', 'environments.py', 'execution_agent.py',
+    'reproduction.py', 'reproduction_report.py', 'environments.py', 'execution_agent.py', 'experiments.py', 'workflow.py', 'automation.py', 'sandbox_runtime.py', 'manifest.py',
 )
 TOOL_FILES = (
     'bootstrap_pilot.py', 'current_forms_smoke.mjs', 'current_ui_smoke.mjs',
     'live_workflow_probe.py', 'prepare_ui_preview.py', 'package_github.py',
-    'multi_paper_validation.py', 'reproduction_ui_smoke.mjs', 'agent_capability_probe.py',
-    'agent_workflow_validation.py', 'agent_case_verify.py', 'agent_case_solve.py', 'agent_case_resume.py', 'agent_ui_contract_test.mjs',
+    'multi_paper_validation.py', 'reproduction_ui_smoke.mjs', 'report_ui_smoke.mjs', 'agent_capability_probe.py',
+    'agent_workflow_validation.py', 'agent_case_verify.py', 'agent_case_solve.py', 'agent_case_resume.py', 'agent_ui_contract_test.mjs', 'paper_workflow_validation.py', 'paper_workflow_ui_smoke.mjs', 'paper_acceptance_report.py',
 )
 PILOT_FILES = ('README.md', 'econlab_qse.m', 'provenance.json')
 BLOCKED_PARTS = {'.local', '.venv', 'venv', '__pycache__', '.git', '.codex', '.aws', 'node_modules', 'dist'}
@@ -68,7 +68,7 @@ def sources() -> list[Path]:
     paths = [ROOT / name for name in ROOT_FILES]
     paths += [ROOT / 'econlab' / name for name in APP_FILES]
     paths += [ROOT / 'econlab' / 'tools' / name for name in TOOL_FILES]
-    paths += [ROOT / 'econlab' / 'tests' / 'test_current.py',ROOT / 'econlab' / 'tests' / 'test_reproduction.py']
+    paths += [p for p in (ROOT / 'econlab' / 'tests').glob('*.py') if p.is_file()]
     paths += [ROOT / 'econlab' / 'pilot' / name for name in PILOT_FILES]
     paths += [p for p in (ROOT / 'econlab' / 'static').rglob('*') if p.is_file()]
     paths += [p for p in ROOT.glob('LICENSE*') if p.is_file()]

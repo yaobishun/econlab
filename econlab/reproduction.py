@@ -123,6 +123,20 @@ def derive(pid,proposal):
         name+='.mat' if operation=='mat_fields' else '.json'
     if role not in ('data','reference'):raise ValueError('Derived materials must be input data or reference results')
     refs=catalog.check_evidence(pid,proposal['evidence'],True)
+    if role=='reference':
+        if operation=='paper_values':
+            aid=proposal['source_asset'] or (refs[0].get('asset_id') if refs else '') or catalog.get('paper',pid)['original_asset']
+            source=catalog.asset(aid)
+            if source['paper_id']!=pid or source['role'] not in ('original','appendix'):raise ValueError('Paper reference values must cite an original source PDF')
+            proposal={**proposal,'source_asset':aid}
+        else:
+            seen=set()
+            def independent(aid):
+                if aid in seen:raise ValueError('Reference provenance cycle')
+                seen.add(aid);source=catalog.asset(aid);meta=source['metadata']
+                if source['paper_id']!=pid or meta.get('task_id') or meta.get('provenance') in ('agent_execution_artifact','agent_inspection_artifact','generated_implementation'):raise ValueError('A generated implementation artifact cannot become its own independent reference')
+                if meta.get('provenance')=='declared_transformation':independent(meta['source_asset'])
+            independent(proposal['source_asset'])
     if operation=='mat_fields':
         from scipy.io import loadmat,savemat
         import io
@@ -178,46 +192,11 @@ def verify(jid,pid,tool_id):
     if t['spec'].get('execution_task_id'):
         import execution_agent
         execution_agent.record_validation(pid,t,result)
-    return checkpoint(jid,pid,'verified' if result['status']=='passed' else 'failed','复现通过，可用于适用范围内的问题求解' if result['status']=='passed' else '复现未通过，保留日志等待检查或修正',tool_id=tool_id,run_id=result['run_id'],gaps=[] if result['status']=='passed' else [result.get('error','指定输出未满足误差标准')])
+    return checkpoint(jid,pid,'verified' if result['status']=='passed' else 'failed','单项复现通过；能否求解仍以完整实验清单的整篇验收为准' if result['status']=='passed' else '复现未通过，保留日志等待检查或修正',tool_id=tool_id,run_id=result['run_id'],gaps=[] if result['status']=='passed' else [result.get('error','指定输出未满足误差标准')])
 
 def complete(jid,pid,options=None):
-    import engine
-    options=options or {}
-    with engine.paper_lock(pid):
-        p=catalog.get('paper',pid);old=materials.state(pid)['state']
-        requested=options.get('experiment_request',old.get('experiment_request',''))
-        changed_request=requested!=old.get('experiment_request','')
-        tool_id=options.get('tool_id') or old.get('tool_id')
-        if options.get('phase')=='verify':
-            if changed_request:raise ValueError('实验与输出目标已改变，请先准备新方案再审核验证')
-            if not tool_id:raise ValueError('尚未准备可验证工具')
-            return verify(jid,pid,tool_id)
-        current_state=materials.state(pid)
-        materials.progress(pid,current_state['status'],current_state['stage'],experiment_request=requested)
-        if not p['coverage'].get('completed'):raise ValueError('请先完成PDF逐页分析，再补全复现材料')
-        if options.get('repair') and tool_id:
-            import execution_agent
-            return execution_agent.prepare(jid,pid,{**options,'tool_id':tool_id})
-        if not changed_request and not any(options.get(k) for k in ('refresh_search','repair','urls','new_materials')):
-            messages=catalog.messages(catalog.session('paper',pid)['id']);pending=messages[-1] if messages else None
-            assessment=old.get('assessment',{});mid=assessment.get('method_id')
-            if mid and pending and pending['role']=='user' and pending['kind']=='implementation' and pending.get('metadata',{}).get('turn_id'):
-                method=catalog.get('method',mid);tools=[catalog.get('tool',t['id']) for t in method['tools']]
-                if all(r['updated']<=pending['created'] for r in [p,method,*tools]) and all(a['created']<=pending['created'] for a in p['assets']):
-                    checkpoint(jid,pid,'preparing','继续已保存的工具生成任务，保留材料与原验收范围')
-                    built=engine.ask(jid,pid,pending['text'],BUILD,kind='implementation')
-                    return save_prepared(jid,pid,built,mid,tools,method['revision'])
-        if not changed_request and not any(options.get(k) for k in ('refresh_search','repair','urls','new_materials')):
-            for t in p['tools']:
-                if t['validation_status']!='verified':continue
-                full=catalog.get('tool',t['id']);fingerprint=catalog.fingerprint(full)
-                if any(r['kind']=='validation' and r['status']=='passed' and r['fingerprint']==fingerprint for r in full['runs']):
-                    return checkpoint(jid,pid,'verified','当前版本已通过复现，无需重复准备',tool_id=t['id'],method_id=t['method_id'],gaps=[])
-        if not changed_request and not options.get('refresh_search') and not options.get('repair') and not options.get('urls'):
-            t=next((t for t in p['tools'] if t['id']==tool_id and t['revision']==old.get('prepared_revision')),None)
-            if t and materials.state(pid)['status']=='awaiting_review':return verify(jid,pid,t['id'])
-        import execution_agent
-        return execution_agent.prepare(jid,pid,options)
+    import workflow
+    return workflow.run(jid,pid,options)
 
 
 def save_prepared(jid,pid,built,mid,tools,method_revision):
@@ -254,7 +233,7 @@ def save_prepared(jid,pid,built,mid,tools,method_revision):
         # The runtime writes this implementation as its declared entrypoint.
         spec.setdefault('bundle_paths',{})[code['id']]='implementation-source/'+name
     target=next((t for t in tools if t['id']==built['tool_id']),None)
-    if target and target['validation_status']=='verified':target=None
+    if target and target['validation_status']=='verified' and not spec.get('paper_controller'):target=None
     if target:
         tool=catalog.update('tool',target['id'],{k:built[k] for k in ('name','language','code')}|{'spec':spec},target['revision'],'Codex','复现材料补全：准备实现，等待人工审核')
     else:tool=catalog.create_tool(pid,mid,built['name'],spec,built['code'],built['language'],'Codex')

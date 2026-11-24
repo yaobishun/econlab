@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import asyncio,json,os,webbrowser
 from fastapi import FastAPI,Request,UploadFile,File,Form,HTTPException
-from fastapi.responses import FileResponse,JSONResponse
+from fastapi.responses import FileResponse,JSONResponse,Response
 from fastapi.staticfiles import StaticFiles
 import catalog,engine,runner,store
 from provider_bridge import bridge
@@ -29,8 +29,11 @@ async def local_guard(request,call_next):
 @app.exception_handler(ValueError)
 async def bad(request,error):return JSONResponse({'detail':str(error)},409 if 'conflict' in str(error).lower() else 400)
 
+@app.exception_handler(RuntimeError)
+async def unavailable(request,error):return JSONResponse({'detail':str(error)},503)
+
 @app.get('/api/bootstrap')
-def bootstrap():return {'version':store.VERSION,'data_path':str(store.DATA),'stats':catalog.stats(),'provider':'codex','ocr':False,'model':store.get_setting('model')}
+def bootstrap():return {'version':store.VERSION,'data_path':str(store.DATA),'stats':catalog.stats(),'provider':'codex','ocr':False,'model':store.get_setting('model'),'reproduction_mode':store.get_setting('reproduction_mode','automatic')}
 @app.get('/api/connection')
 def connection():return bridge.status()
 @app.get('/api/models')
@@ -44,9 +47,15 @@ def login():
     return result
 @app.post('/api/settings')
 def settings(body:dict):
+    mode=body.get('reproduction_mode')
+    if mode is not None:
+        if mode not in ('automatic','manual'):raise ValueError('Unknown reproduction mode')
     model=body.get('model')
     if model and model not in {m['model'] for m in bridge.models()}:raise ValueError('Unknown Codex model')
-    store.set_setting('model',model);return {'ok':True}
+    with store.db() as c:
+        for key,value in [('reproduction_mode',mode),('model',model)]:
+            if key in body:c.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,store.encode(value)))
+    return {'ok':True}
 
 @app.get('/api/papers')
 def papers(q:str=''):return catalog.listing('paper',q)
@@ -100,6 +109,47 @@ def reproduction_state(pid:str):
     import materials
     catalog.get('paper',pid);return materials.state(pid)
 
+@app.get('/api/papers/{pid}/report')
+def paper_report(pid:str):
+    import reproduction_report
+    return reproduction_report.collect(pid)
+
+@app.put('/api/papers/{pid}/report')
+def save_paper_report(pid:str,body:dict):
+    import reproduction_report
+    return reproduction_report.save(pid,body['document'],body['revision'],body['basis'],body.get('actor',''),body.get('reason',''))
+
+@app.post('/api/papers/{pid}/report/generate')
+def generate_paper_report(pid:str,body:dict):
+    import reproduction_report
+    catalog.get('paper',pid)
+    return engine.submit('reproduction_report',pid,reproduction_report.generate,body['revision'],body['basis'])
+
+@app.post('/api/papers/{pid}/report/review')
+def review_paper_report(pid:str,body:dict):
+    import reproduction_report
+    return reproduction_report.review(pid,body['revision'],body['basis'],body['status'],body.get('reviewer',''),body.get('opinion',''))
+
+@app.get('/api/papers/{pid}/report/results')
+def paper_report_results(pid:str,experiment_id:str,field:str,offset:int=0,limit:int=100):
+    import reproduction_report
+    return reproduction_report.result_rows(pid,experiment_id,field,offset,limit)
+
+@app.get('/api/papers/{pid}/report/results.csv')
+def paper_report_csv(pid:str,experiment_id:str,field:str):
+    import reproduction_report
+    return Response(reproduction_report.result_csv(pid,experiment_id,field),media_type='text/csv; charset=utf-8',headers={'Content-Disposition':'attachment; filename="EconLab-comparison.csv"'})
+
+@app.get('/api/papers/{pid}/report/export')
+def paper_report_export(pid:str):
+    import reproduction_report
+    return JSONResponse(reproduction_report.export_document(pid),headers={'Content-Disposition':'attachment; filename="EconLab-reproduction-'+pid+'.json"'})
+
+@app.get('/api/papers/{pid}/report/runs/{rid}/package')
+def paper_report_package(pid:str,rid:str):
+    import reproduction_report
+    return Response(reproduction_report.replay_package(pid,rid),media_type='application/zip',headers={'Content-Disposition':'attachment; filename="EconLab-run-'+rid+'.zip"'})
+
 @app.post('/api/papers/{pid}/reproduction')
 def complete_materials(pid:str,body:dict|None=None):
     import reproduction
@@ -114,6 +164,38 @@ def complete_materials(pid:str,body:dict|None=None):
     return engine.submit('reproduction',pid,reproduction.complete,body)
 @app.post('/api/papers/{pid}/stop')
 def stop_paper(pid:str):return engine.stop_paper(pid)
+
+@app.get('/api/papers/{pid}/experiments')
+def experiment_inventory(pid:str):
+    import experiments,workflow
+    catalog.get('paper',pid)
+    return {'inventory':experiments.public_summary(pid),'controller':workflow.state(pid),'memory':experiments.memory(pid)}
+
+@app.put('/api/papers/{pid}/experiments')
+def edit_experiments(pid:str,body:dict):
+    import experiments
+    experiments.save(pid,body['document'],body['revision'],body.get('actor',''),body.get('reason',''))
+    return experiment_inventory(pid)
+
+@app.post('/api/papers/{pid}/experiments/review')
+def review_experiments(pid:str,body:dict):
+    import experiments
+    return experiments.review(pid,body['revision'],body.get('reviewer',''),body.get('opinion',''))
+
+@app.get('/api/papers/{pid}/experiments/history')
+def experiment_history(pid:str):
+    catalog.get('paper',pid)
+    import automation
+    with store.db() as c:
+        return {'revisions':[dict(r)|{'document':store.decode(r['document'])} for r in c.execute('SELECT * FROM experiment_plan_history WHERE paper_id=? ORDER BY revision DESC',(pid,))],
+                'approvals':[dict(r) for r in c.execute('SELECT * FROM experiment_approvals WHERE paper_id=? ORDER BY created DESC',(pid,))],
+                'qualitative_checks':[dict(r) for r in c.execute('SELECT * FROM qualitative_checks WHERE paper_id=? ORDER BY created DESC',(pid,))],
+                'automatic_checks':automation.history(pid)}
+
+@app.post('/api/papers/{pid}/experiments/qualitative')
+def qualitative_check(pid:str,body:dict):
+    import experiments
+    return experiments.check_qualitative(pid,body['experiment_id'],body['revision'],body.get('reviewer',''),body.get('opinion',''))
 
 @app.get('/api/papers/{pid}/agent')
 def agent_task(pid:str):
@@ -162,14 +244,39 @@ def run(tid:str,body:dict):
 @app.get('/api/records/{kind}/{identifier}')
 def record(kind:str,identifier:str):
     result=catalog.get(kind,identifier)
+    import experiments,workflow
     if kind=='paper':
+        result['reproduction_mode']=store.get_setting('reproduction_mode','automatic')
+        result['experiment_inventory']=experiments.public_summary(identifier)
+        result['controller']=workflow.state(identifier)
         for asset in result['assets']:asset.pop('text',None)
         for url in result.get('reproduction',{}).get('urls',[]):url.get('result',{}).pop('text',None)
+    elif kind=='method':result['paper_experiments']=[{'paper_id':p['id'],'title':p['title'],'inventory':experiments.public_summary(p['id'])} for p in result['sources']]
+    elif kind=='tool':
+        try:
+            eligibility=experiments.require_eligible(result)
+            result['execution_eligible']=True;result['paper_coverage']=eligibility['counts']
+        except ValueError as exc:result['execution_eligible']=False;result['eligibility_gap']=str(exc)
+    if kind in ('method','tool'):
+        import automation
+        try:result['automatic_check_current']=automation.checked(kind,identifier,automation.binding(kind,result))
+        except (ValueError,OSError):result['automatic_check_current']=False
     return result
 @app.put('/api/records/{kind}/{identifier}')
-def edit(kind:str,identifier:str,body:dict):return catalog.update(kind,identifier,body['patch'],body['revision'],body.get('actor',''),body.get('reason',''),bool(body.get('visual_review',False)))
+def edit(kind:str,identifier:str,body:dict):
+    result=catalog.update(kind,identifier,body['patch'],body['revision'],body.get('actor',''),body.get('reason',''),bool(body.get('visual_review',False)))
+    record_decision(kind,result,{'kind':'manual_edit','actor':body.get('actor',''),'reason':body.get('reason',''),'revision':result['revision']})
+    return result
 @app.post('/api/records/{kind}/{identifier}/review')
-def review(kind:str,identifier:str,body:dict):return catalog.review(kind,identifier,body['status'],body.get('reviewer',''),body.get('opinion',''),body['revision'])
+def review(kind:str,identifier:str,body:dict):
+    result=catalog.review(kind,identifier,body['status'],body.get('reviewer',''),body.get('opinion',''),body['revision'])
+    record_decision(kind,result,{'kind':'human_review','reviewer':body.get('reviewer',''),'opinion':body.get('opinion',''),'status':body['status'],'revision':result['revision']})
+    return result
+
+def record_decision(kind,result,event):
+    import experiments
+    pids=[result['id']] if kind=='paper' else [p['id'] for p in result['sources']]
+    for pid in pids:experiments.remember(pid,event={**event,'entity_type':kind,'entity_id':result['id']})
 @app.post('/api/records/{kind}/{identifier}/restore')
 def restore(kind:str,identifier:str,body:dict):return catalog.restore(kind,identifier,body['restore_revision'],body['revision'],body.get('actor',''))
 @app.get('/api/jobs')
